@@ -42,6 +42,15 @@ pub fn decode_to_ranges(data: &[u8], count: usize) -> (Vec<u8>, Vec<(usize, usiz
     (raw, ranges)
 }
 
+/// Decode LZ4 data to owned byte blobs (no UTF-8 validation). Used for jsonb payloads.
+pub fn decode_bytes(data: &[u8], count: usize) -> Vec<Vec<u8>> {
+    let (raw, ranges) = decode_to_ranges(data, count);
+    ranges
+        .iter()
+        .map(|&(off, len)| raw[off..off + len].to_vec())
+        .collect()
+}
+
 pub fn decode(data: &[u8], count: usize) -> Vec<String> {
     if count == 0 {
         return Vec::new();
@@ -54,9 +63,7 @@ pub fn decode(data: &[u8], count: usize) -> Vec<String> {
     for _ in 0..count {
         let str_len = u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
-        let s = std::str::from_utf8(&raw[offset..offset + str_len])
-            .expect("invalid UTF-8 in LZ4 data")
-            .to_string();
+        let s = String::from_utf8_lossy(&raw[offset..offset + str_len]).into_owned();
         offset += str_len;
         values.push(s);
     }
@@ -123,6 +130,15 @@ pub fn encode_blocked(values: &[&str], block_size: usize) -> Vec<u8> {
     buf
 }
 
+/// Decode all blocks of an Lz4Blocked column, returning owned byte blobs.
+pub fn decode_bytes_blocked(data: &[u8], count: usize) -> Vec<Vec<u8>> {
+    let (raw, ranges) = decode_to_ranges_blocked(data, count, None);
+    ranges
+        .iter()
+        .map(|&(off, len)| raw[off..off + len].to_vec())
+        .collect()
+}
+
 /// Decode all blocks of an Lz4Blocked column, returning all strings.
 pub fn decode_blocked(data: &[u8], count: usize) -> Vec<String> {
     if count == 0 {
@@ -160,9 +176,7 @@ pub fn decode_blocked(data: &[u8], count: usize) -> Vec<String> {
     for _ in 0..count {
         let str_len = u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
-        let s = std::str::from_utf8(&raw[offset..offset + str_len])
-            .expect("invalid UTF-8 in LZ4 data")
-            .to_string();
+        let s = String::from_utf8_lossy(&raw[offset..offset + str_len]).into_owned();
         offset += str_len;
         values.push(s);
     }

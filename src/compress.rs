@@ -1506,7 +1506,10 @@ pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
 
         let old = pgrx::pg_sys::MemoryContextSwitchTo(scratch);
 
-        let c_text = std::ffi::CString::new(text).expect("jsonb text contains null byte");
+        // Legacy billing rows may carry NUL in jsonb text; strip so decompress can complete.
+        let sanitized: String = text.chars().filter(|c| *c != '\0').collect();
+        let c_text =
+            std::ffi::CString::new(sanitized).expect("jsonb text contains null byte after sanitize");
         let mut typinput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
         let mut typioparam: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
         pgrx::pg_sys::getTypeInputInfo(pgrx::pg_sys::JSONBOID, &mut typinput, &mut typioparam);
@@ -1523,6 +1526,34 @@ pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
         pgrx::pg_sys::MemoryContextReset(scratch);
 
         bytes
+    }
+}
+
+/// Render a binary jsonb varlena payload (post-header bytes) as a SQL literal.
+unsafe fn jsonb_payload_to_sql_literal(payload: &[u8]) -> String {
+    unsafe {
+        const VARHDRSZ: usize = pgrx::pg_sys::VARHDRSZ;
+        let total_len = (VARHDRSZ + payload.len()) as i32;
+        let varlena = pgrx::pg_sys::palloc(total_len as usize) as *mut pgrx::pg_sys::varlena;
+        pgrx::set_varsize_4b(varlena, total_len);
+        if !payload.is_empty() {
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                (varlena as *mut u8).add(VARHDRSZ),
+                payload.len(),
+            );
+        }
+        let datum = pgrx::pg_sys::Datum::from(varlena as usize);
+        let mut typoutput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
+        let mut isvarlena = false;
+        pgrx::pg_sys::getTypeOutputInfo(
+            pgrx::pg_sys::JSONBOID,
+            &mut typoutput,
+            &mut isvarlena,
+        );
+        let cstr_ptr = pgrx::pg_sys::OidOutputFunctionCall(typoutput, datum);
+        let text = std::ffi::CStr::from_ptr(cstr_ptr).to_string_lossy();
+        format!("'{}'::jsonb", text.replace('\'', "''"))
     }
 }
 
@@ -3372,6 +3403,13 @@ fn estimate_raw_size(client: &SpiClient, table_fqn: &str) -> i64 {
 // Decompression
 // ============================================================================
 
+/// One decompressed cell — text columns use UTF-8 strings; jsonb keeps raw bytes.
+#[derive(Clone)]
+enum DecompCell {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
 fn decompress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     // Bypass the DML-on-compressed check for the INSERT we are about to do
     crate::scan::set_dml_bypass(true);
@@ -3532,15 +3570,16 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         }
 
         // Decompress all columns
-        let mut decompressed_cols: Vec<(String, Vec<Option<String>>)> = Vec::new();
+        let mut decompressed_cols: Vec<(String, Vec<Option<DecompCell>>)> = Vec::new();
 
         // Segment-by columns: repeat the value for every row
         let mut seg_idx = 0;
         for col in &columns {
             if col.is_segment_by {
                 let val = &seg_meta.segment_by_vals[seg_idx];
-                let repeated: Vec<Option<String>> =
-                    (0..seg_meta.row_count).map(|_| val.clone()).collect();
+                let repeated: Vec<Option<DecompCell>> = (0..seg_meta.row_count)
+                    .map(|_| val.as_ref().map(|s| DecompCell::Text(s.clone())))
+                    .collect();
                 decompressed_cols.push((col.name.clone(), repeated));
                 seg_idx += 1;
             }
@@ -3549,12 +3588,29 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         // Compressed columns: decompress from blob_map
         for (ci, name, data_type) in &non_seg_cols {
             let blob = blob_map.get(ci).cloned().unwrap_or_default();
-            let values = decompress_column_values(&blob, data_type);
-            decompressed_cols.push((name.clone(), values));
+            if data_type.to_lowercase() == "jsonb" {
+                let values = decompress_column_byte_values(&blob);
+                decompressed_cols.push((
+                    name.clone(),
+                    values
+                        .into_iter()
+                        .map(|o| o.map(DecompCell::Bytes))
+                        .collect(),
+                ));
+            } else {
+                let values = decompress_column_values(&blob, data_type);
+                decompressed_cols.push((
+                    name.clone(),
+                    values
+                        .into_iter()
+                        .map(|o| o.map(DecompCell::Text))
+                        .collect(),
+                ));
+            }
         }
 
         // Sort columns back to original order
-        let mut ordered_cols: Vec<(String, Vec<Option<String>>)> = Vec::new();
+        let mut ordered_cols: Vec<(String, Vec<Option<DecompCell>>)> = Vec::new();
         for col in &columns {
             for dc in &decompressed_cols {
                 if dc.0 == col.name {
@@ -3586,7 +3642,12 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
                         let col_meta = &columns[col_idx];
                         match &values[row_idx] {
                             None => "NULL".to_string(),
-                            Some(v) => format_value_for_insert(v, &col_meta.data_type),
+                            Some(DecompCell::Text(v)) => {
+                                format_value_for_insert(v, &col_meta.data_type)
+                            }
+                            Some(DecompCell::Bytes(b)) => unsafe {
+                                jsonb_payload_to_sql_literal(b)
+                            },
                         }
                     })
                     .collect();
@@ -3646,6 +3707,40 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         "Decompressed {}.{}: {} rows restored",
         schema, part_table, total_rows_restored
     )
+}
+
+/// Decompress a jsonb column blob, preserving raw binary payloads (no UTF-8).
+fn decompress_column_byte_values(blob: &[u8]) -> Vec<Option<Vec<u8>>> {
+    if blob.is_empty() {
+        return Vec::new();
+    }
+
+    let cc = CompressedColumn::from_bytes(blob);
+    let total_count = cc.row_count as usize;
+    let non_null = count_non_null(&cc.null_bitmap, total_count);
+
+    let values: Vec<Vec<u8>> = match cc.type_tag {
+        CompressionType::Dictionary => {
+            let slices = compression::dictionary::decode_to_byte_slices(&cc.data, non_null);
+            slices.iter().map(|s| s.to_vec()).collect()
+        }
+        CompressionType::DictionaryLz4 => {
+            let normalized = compression::dictionary::normalize_lz4(&cc.data);
+            let slices = compression::dictionary::decode_to_byte_slices(&normalized, non_null);
+            slices.iter().map(|s| s.to_vec()).collect()
+        }
+        CompressionType::Lz4 => compression::lz4::decode_bytes(&cc.data, non_null),
+        CompressionType::Lz4Blocked => {
+            compression::lz4::decode_bytes_blocked(&cc.data, non_null)
+        }
+        other => {
+            pgrx::error!(
+                "pg_deltax: unexpected compression type {:?} for jsonb decompress",
+                other
+            );
+        }
+    };
+    compression::reinsert_nulls(&values, &cc.null_bitmap, total_count)
 }
 
 /// Decompress a column blob back to string representations.

@@ -40,8 +40,13 @@ pub fn parse_header(data: &[u8]) -> DictHeader<'_> {
     for _ in 0..dict_size {
         let str_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
-        let s = std::str::from_utf8(&data[offset..offset + str_len])
-            .expect("invalid UTF-8 in dictionary");
+        let slice = &data[offset..offset + str_len];
+        let s: &str = match std::str::from_utf8(slice) {
+            Ok(s) => s,
+            // Billing audit fields may carry legacy binary-ish bytes; lossy decode
+            // on decompress beats leaving the partition permanently read-only.
+            Err(_) => Box::leak(String::from_utf8_lossy(slice).into_owned().into_boxed_str()),
+        };
         offset += str_len;
         dict.push(s);
     }
