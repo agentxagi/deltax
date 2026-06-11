@@ -845,6 +845,17 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         return format!("Partition {}.{} is already compressed", schema, part_table);
     }
 
+    // Open month partition must stay heap — compressed partitions are read-only.
+    let range_end_usec = part_info.range_end.into_inner() + PG_EPOCH_OFFSET_USEC;
+    if range_end_usec > crate::partition::now_usec() {
+        pgrx::error!(
+            "pg_deltax: refusing to compress open partition {}.{} (range_end {} > now())",
+            schema,
+            part_table,
+            part_info.range_end
+        );
+    }
+
     // 2. Get deltatable info (compression settings)
     let ht = catalog::get_deltatable_by_id(client, part_info.deltatable_id)
         .expect("failed to query deltatable")
