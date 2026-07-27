@@ -611,21 +611,42 @@ def test_scenario_2_replicate_companion_tables_directly(replicated_pair):
     #    then verify a real-row query returns the full set. We use a WHERE
     #    clause so the query goes through the meta scan (DeltaXDecompress),
     #    not the count(*) pushdown that bypasses the meta table.
+    #
+    #    The three companion tables sync as three independent tables, so a
+    #    row count that already matches proves `_meta` arrived — not `_blobs`.
+    #    Reading a value while `_blobs` is still short is a genuinely
+    #    inconsistent partition and pg_deltax now says so instead of
+    #    panicking, so wait for the blob rows too before asserting values.
+    with _db_conn(repl["pub_db"]) as pub:
+        expected_blobs = pub.execute(
+            "SELECT sum(c) FROM ("
+            "  SELECT count(*) AS c FROM \"_deltax_compressed\".\"metrics_p20250615_blobs\""
+            ") s"
+        ).fetchone()[0]
+
     with _db_conn(repl["sub_db"]) as sub:
         deadline = time.time() + REPLICATION_TIMEOUT_S
         n = None
+        blobs = None
         while time.time() < deadline:
             n = sub.execute(
                 f"SELECT count(*) FROM metrics "
                 f"WHERE ts >= '{BASE_TS}'::timestamptz"
             ).fetchone()[0]
+            blobs = sub.execute(
+                'SELECT count(*) FROM "_deltax_compressed"."metrics_p20250615_blobs"'
+            ).fetchone()[0]
             sub.commit()
-            if n == 100:
+            if n == 100 and blobs == expected_blobs:
                 break
             time.sleep(0.2)
         assert n == 100, (
             f"subscriber has {n} rows after initial sync, expected 100 — "
             f"companion-table replication may have failed"
+        )
+        assert blobs == expected_blobs, (
+            f"subscriber has {blobs} blob rows, publisher has {expected_blobs} — "
+            f"companion-table replication did not finish"
         )
 
         # Belt and braces: the data really came through companion tables,
