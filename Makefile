@@ -11,6 +11,17 @@ QUERY_CONTAINER = pg_deltax_query
 PG_VERSIONS ?= 17 18
 VENV         = .venv
 
+# Extra flags for every `docker build` below. On hosts where the default bridge
+# network has no egress (apt/crates.io time out inside the build container),
+# build with the host network instead:
+#   make image PG_MAJOR=18 DOCKER_BUILD_FLAGS=--network=host
+DOCKER_BUILD_FLAGS ?=
+
+# Same, for the toolchain containers that run cargo (clippy/fmt/test need
+# crates.io on a cold cargo volume):
+#   make clippy PG_MAJOR=18 DOCKER_RUN_FLAGS=--network=host
+DOCKER_RUN_FLAGS ?=
+
 .PHONY: dev-image image image-fresh correctness-image test build clippy fmt fmt-check coverage coverage-all run psql cargo clean \
        integration-test \
        correctness-smoke correctness correctness-fuzz correctness-clean \
@@ -22,23 +33,23 @@ VENV         = .venv
 
 # Build the dev toolchain image (rebuilds only when Dockerfile.dev changes)
 dev-image:
-	docker build -f docker/Dockerfile.dev --build-arg PG_MAJOR=$(PG_MAJOR) -t $(DEV_IMAGE) docker/
+	docker build $(DOCKER_BUILD_FLAGS) -f docker/Dockerfile.dev --build-arg PG_MAJOR=$(PG_MAJOR) -t $(DEV_IMAGE) docker/
 
 # Generic: run any cargo command. Usage: make cargo CMD="check"
 cargo: dev-image
-	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+	docker run $(DOCKER_RUN_FLAGS) --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
 		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) cargo $(CMD)
 
 test: dev-image
-	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+	docker run $(DOCKER_RUN_FLAGS) --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
 		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) sh -c "cargo pgrx test pg$(PG_MAJOR)"
 
 build: dev-image
-	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+	docker run $(DOCKER_RUN_FLAGS) --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
 		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) cargo build --features pg$(PG_MAJOR) --no-default-features
 
 clippy: dev-image
-	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+	docker run $(DOCKER_RUN_FLAGS) --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
 		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) cargo clippy --features pg$(PG_MAJOR) --no-default-features --tests
 
 # Format code with rustfmt. Pass FILE=... to scope to a single file (per-session cleanup style).
@@ -50,17 +61,17 @@ clippy: dev-image
 # FILE= is set we invoke `rustfmt` directly with `skip_children=true` so the
 # scope really is just that one file. Edition matches Cargo.toml.
 fmt: dev-image
-	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+	docker run $(DOCKER_RUN_FLAGS) --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
 		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) \
 		$(if $(FILE),rustfmt --edition 2024 --config skip_children=true $(FILE),cargo fmt)
 
 # Verify formatting without modifying files. Whole-tree only.
 fmt-check: dev-image
-	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+	docker run $(DOCKER_RUN_FLAGS) --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
 		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) cargo fmt -- --check
 
 coverage: dev-image
-	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+	docker run $(DOCKER_RUN_FLAGS) --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
 		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) bash -c '\
 		eval "$$(cargo llvm-cov show-env --export-prefix)" && \
 		cargo llvm-cov clean --workspace && \
@@ -83,7 +94,7 @@ coverage-all: dev-image $(VENV)/.stamp
 	@mkdir -p $(CURDIR)/coverage/profraw $(CURDIR)/coverage/pkg
 	# Step 1: instrumented build + unit tests + install extension
 	# Uses cargo pgrx install (dev profile) so the .so matches the test profraw.
-	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+	docker run $(DOCKER_RUN_FLAGS) --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
 		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) bash -c '\
 		eval "$$(cargo llvm-cov show-env --export-prefix)" && \
 		cargo llvm-cov clean --workspace && \
@@ -97,7 +108,7 @@ coverage-all: dev-image $(VENV)/.stamp
 		cp /usr/share/postgresql/$(PG_MAJOR)/extension/pg_deltax* \
 			/build/pg_deltax/coverage/pkg/usr/share/postgresql/$(PG_MAJOR)/extension/'
 	# Step 2: build runtime image with the same instrumented .so
-	docker build -f docker/Dockerfile.coverage --build-arg PG_MAJOR=$(PG_MAJOR) -t $(COV_IMAGE) .
+	docker build $(DOCKER_BUILD_FLAGS) -f docker/Dockerfile.coverage --build-arg PG_MAJOR=$(PG_MAJOR) -t $(COV_IMAGE) .
 	# Step 3: run integration tests against instrumented image
 	-docker rm -f pg_deltax_cov 2>/dev/null
 	docker run -d --name pg_deltax_cov \
@@ -117,7 +128,7 @@ coverage-all: dev-image $(VENV)/.stamp
 	docker stop -t 10 pg_deltax_cov
 	docker rm pg_deltax_cov
 	# Step 4: merge integration profraw and generate combined report
-	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+	docker run $(DOCKER_RUN_FLAGS) --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
 		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) bash -c '\
 		eval "$$(cargo llvm-cov show-env --export-prefix)" && \
 		PROFDIR=$$(dirname "$$LLVM_PROFILE_FILE") && \
@@ -129,16 +140,16 @@ coverage-all: dev-image $(VENV)/.stamp
 
 # Build the runtime image (production-like, no build tools)
 image: dev-image
-	docker build -f docker/Dockerfile --build-arg PG_MAJOR=$(PG_MAJOR) -t $(IMAGE) .
+	docker build $(DOCKER_BUILD_FLAGS) -f docker/Dockerfile --build-arg PG_MAJOR=$(PG_MAJOR) -t $(IMAGE) .
 
 # Force-rebuild the runtime image (no Docker cache)
 image-fresh: dev-image
-	docker build --no-cache -f docker/Dockerfile --build-arg PG_MAJOR=$(PG_MAJOR) -t $(IMAGE) .
+	docker build $(DOCKER_BUILD_FLAGS) --no-cache -f docker/Dockerfile --build-arg PG_MAJOR=$(PG_MAJOR) -t $(IMAGE) .
 
 # Build a worktree-scoped runtime image for correctness tests. This avoids
 # cross-worktree races with integration tests rebuilding the shared $(IMAGE) tag.
 correctness-image: dev-image
-	docker build -f docker/Dockerfile --build-arg PG_MAJOR=$(PG_MAJOR) -t $(CORRECTNESS_IMAGE) .
+	docker build $(DOCKER_BUILD_FLAGS) -f docker/Dockerfile --build-arg PG_MAJOR=$(PG_MAJOR) -t $(CORRECTNESS_IMAGE) .
 
 # Run postgres with the extension for manual testing
 run: image

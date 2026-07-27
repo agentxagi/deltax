@@ -436,6 +436,44 @@ fn deltax_enable_compression(
                 )
             });
 
+        // Warn now about columns that will make compression refuse later. Doing
+        // it here means the operator finds out while configuring the table, not
+        // a month later when the first partition closes.
+        {
+            let types = client
+                .select(
+                    "SELECT column_name::text, data_type::text
+                       FROM information_schema.columns
+                      WHERE table_schema = $1 AND table_name = $2
+                      ORDER BY ordinal_position",
+                    None,
+                    &[schema.as_str().into(), table.as_str().into()],
+                )
+                .expect("failed to read column types");
+            for row in types {
+                let name = row
+                    .get_datum_by_ordinal(1)
+                    .ok()
+                    .and_then(|d| d.value::<String>().ok().flatten());
+                let dt = row
+                    .get_datum_by_ordinal(2)
+                    .ok()
+                    .and_then(|d| d.value::<String>().ok().flatten());
+                if let (Some(name), Some(dt)) = (name, dt)
+                    && let Err(reason) = check_compressible_type(&dt)
+                {
+                    pgrx::warning!(
+                        "pg_deltax: {}.{} column \"{}\" — {}. Compressing a partition of this \
+                         table will be refused until the column is removed.",
+                        schema,
+                        table,
+                        name,
+                        reason
+                    );
+                }
+            }
+        }
+
         // Validate segment_by columns exist
         for col in &segment_by {
             let exists = client
@@ -845,11 +883,16 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         return format!("Partition {}.{} is already compressed", schema, part_table);
     }
 
-    // Open month partition must stay heap — compressed partitions are read-only.
+    // A partition still inside its time range keeps receiving rows, and a
+    // compressed partition is read-only — sealing it turns inserts into errors.
+    // Opt in per session when that is genuinely what you want.
     let range_end_usec = part_info.range_end.into_inner() + PG_EPOCH_OFFSET_USEC;
-    if range_end_usec > crate::partition::now_usec() {
+    if range_end_usec > crate::partition::now_usec() && !crate::ALLOW_COMPRESS_OPEN_PARTITION.get()
+    {
         pgrx::error!(
-            "pg_deltax: refusing to compress open partition {}.{} (range_end {} > now())",
+            "pg_deltax: refusing to compress open partition {}.{} (range_end {} > now()); \
+             inserts into a compressed partition fail. Set \
+             pg_deltax.allow_compress_open_partition = on to override.",
             schema,
             part_table,
             part_info.range_end
@@ -881,6 +924,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     if columns.is_empty() {
         pgrx::error!("pg_deltax: no columns found for {}.{}", schema, part_table);
     }
+    assert_columns_compressible(&schema, &part_table, &columns);
 
     // 4. Estimate row count from pg_class stats (instant, no scan).
     // Used for skipping empty partitions.
@@ -1230,6 +1274,77 @@ impl TypedColumn {
     }
 }
 
+/// Types stored as their `::text` form and rebuilt with the type's input
+/// function on read (see `str_to_text_datum`).
+///
+/// This is an allowlist and not a fallback on purpose. The round trip is exact
+/// only for types whose text output does not depend on a session setting:
+/// `money` moves with `lc_monetary` and `interval` with `IntervalStyle`, so a
+/// partition written under one setting would read back different under another.
+/// Anything absent from this list is refused at compression time rather than
+/// stored as text and guessed at on the way out — which is how a `numeric`
+/// ledger came back with tens of thousands of digits per row in July 2026.
+const TEXT_IO_COMPRESSIBLE: &[&str] = &[
+    "numeric", "decimal", "uuid", "inet", "cidr", "macaddr", "macaddr8", "bytea", "name", "citext",
+];
+
+/// Types whose text form *is* their varlena body — no input function needed.
+const NATIVE_TEXT_TYPES: &[&str] = &[
+    "text",
+    "character varying",
+    "varchar",
+    "character",
+    "char",
+    "bpchar",
+];
+
+/// Whether the compressor can store `data_type` and read it back unchanged.
+///
+/// `Err` carries the reason, ready to be shown to whoever ran the compression.
+pub(crate) fn check_compressible_type(data_type: &str) -> Result<(), String> {
+    let dt = data_type.trim().to_lowercase();
+    // Every kind other than Text has a dedicated codec and a typed read path.
+    if !matches!(classify_column(&dt, false), ColumnKind::Text) {
+        return Ok(());
+    }
+    // Strip a typmod ("numeric(18,8)") — information_schema doesn't emit one,
+    // but format_type and json_extract specs do.
+    let base = dt.split('(').next().unwrap_or(&dt).trim();
+    if NATIVE_TEXT_TYPES.contains(&base) || TEXT_IO_COMPRESSIBLE.contains(&base) {
+        return Ok(());
+    }
+    Err(format!(
+        "type {} is not supported by pg_deltax compression (supported: integer types, real, \
+         double precision, boolean, date, timestamp, timestamptz, text, varchar, char, jsonb, \
+         numeric, uuid, inet, cidr, macaddr, bytea)",
+        data_type
+    ))
+}
+
+/// Refuse to compress a partition holding a column we cannot reconstruct.
+///
+/// Runs before any blob is written. Reporting every offending column in one
+/// error saves a round of trial and error on wide tables.
+fn assert_columns_compressible(schema: &str, table: &str, columns: &[ColumnMeta]) {
+    let offenders: Vec<String> = columns
+        .iter()
+        .filter_map(|c| {
+            check_compressible_type(&c.data_type)
+                .err()
+                .map(|reason| format!("column \"{}\": {}", c.name, reason))
+        })
+        .collect();
+    if !offenders.is_empty() {
+        pgrx::error!(
+            "pg_deltax: cannot compress {}.{} — {}. Leave the partition uncompressed or drop the \
+             column from the table.",
+            schema,
+            table,
+            offenders.join("; ")
+        );
+    }
+}
+
 pub(crate) fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKind {
     if is_segment_by {
         return ColumnKind::Text; // segment_by always read as text for SQL literals
@@ -1519,8 +1634,8 @@ pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
 
         // Legacy billing rows may carry NUL in jsonb text; strip so decompress can complete.
         let sanitized: String = text.chars().filter(|c| *c != '\0').collect();
-        let c_text =
-            std::ffi::CString::new(sanitized).expect("jsonb text contains null byte after sanitize");
+        let c_text = std::ffi::CString::new(sanitized)
+            .expect("jsonb text contains null byte after sanitize");
         let mut typinput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
         let mut typioparam: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
         pgrx::pg_sys::getTypeInputInfo(pgrx::pg_sys::JSONBOID, &mut typinput, &mut typioparam);
@@ -1557,11 +1672,7 @@ unsafe fn jsonb_payload_to_sql_literal(payload: &[u8]) -> String {
         let datum = pgrx::pg_sys::Datum::from(varlena as usize);
         let mut typoutput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
         let mut isvarlena = false;
-        pgrx::pg_sys::getTypeOutputInfo(
-            pgrx::pg_sys::JSONBOID,
-            &mut typoutput,
-            &mut isvarlena,
-        );
+        pgrx::pg_sys::getTypeOutputInfo(pgrx::pg_sys::JSONBOID, &mut typoutput, &mut isvarlena);
         let cstr_ptr = pgrx::pg_sys::OidOutputFunctionCall(typoutput, datum);
         let text = std::ffi::CStr::from_ptr(cstr_ptr).to_string_lossy();
         format!("'{}'::jsonb", text.replace('\'', "''"))
@@ -3741,9 +3852,7 @@ fn decompress_column_byte_values(blob: &[u8]) -> Vec<Option<Vec<u8>>> {
             slices.iter().map(|s| s.to_vec()).collect()
         }
         CompressionType::Lz4 => compression::lz4::decode_bytes(&cc.data, non_null),
-        CompressionType::Lz4Blocked => {
-            compression::lz4::decode_bytes_blocked(&cc.data, non_null)
-        }
+        CompressionType::Lz4Blocked => compression::lz4::decode_bytes_blocked(&cc.data, non_null),
         other => {
             pgrx::error!(
                 "pg_deltax: unexpected compression type {:?} for jsonb decompress",
@@ -4500,6 +4609,52 @@ pub(crate) fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_compressible_type_accepts_typed_and_text_io_types() {
+        for ty in [
+            "smallint",
+            "integer",
+            "bigint",
+            "real",
+            "double precision",
+            "boolean",
+            "date",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "jsonb",
+            "text",
+            "character varying",
+            "character",
+            "numeric",
+            "numeric(18,8)",
+            "uuid",
+            "inet",
+            "bytea",
+        ] {
+            assert!(
+                check_compressible_type(ty).is_ok(),
+                "expected {} to be compressible",
+                ty
+            );
+        }
+    }
+
+    #[test]
+    fn check_compressible_type_refuses_what_it_cannot_rebuild() {
+        // ARRAY is what information_schema reports for any array column;
+        // money and interval have GUC-dependent text output; ranges and
+        // user-defined types have no codec at all.
+        for ty in ["int4range", "ARRAY", "money", "interval", "USER-DEFINED"] {
+            let err =
+                check_compressible_type(ty).expect_err(&format!("expected {} to be refused", ty));
+            assert!(
+                err.contains(ty),
+                "the refusal has to name the type; got: {}",
+                err
+            );
+        }
+    }
 
     #[test]
     fn select_partial_mcv_keeps_heavy_hitters() {

@@ -59,6 +59,12 @@ def pg_container():
         # publications/subscriptions. Strictly a superset of the default
         # wal_level=replica; harmless for all other tests.
         "-c", "wal_level=logical",
+        # Most tests write rows into the newest partition and compress it right
+        # away, which production refuses (a compressed partition is read-only,
+        # so sealing the one still taking inserts breaks ingest). Tests are
+        # allowed to do it; `test_compression.py` covers the refusal itself by
+        # turning this back off for one session.
+        "-c", "pg_deltax.allow_compress_open_partition=on",
     ]
     subprocess.check_call(cmd)
 

@@ -94,6 +94,16 @@ pub(crate) static USE_LZ4: GucSetting<bool> = GucSetting::<bool>::new(true);
 /// Intended for ad-hoc profiling; default off to avoid benchmark noise.
 pub(crate) static PROFILE_PLANNING: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// Allow `deltax_compress_partition` on a partition whose range has not
+/// closed yet.
+///
+/// Compressed partitions are read-only, so sealing the partition that is still
+/// receiving rows turns inserts into errors — which is exactly what happened to
+/// a billing table in June 2026 when an ops script compressed the current
+/// month. Off by default; a caller that really wants it (a test, a backfill of
+/// data that has stopped arriving) has to say so.
+pub(crate) static ALLOW_COMPRESS_OPEN_PARTITION: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
 pub(crate) fn get_parallel_workers() -> usize {
@@ -237,6 +247,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Use Rust regex for parallel REGEXP_REPLACE in GROUP BY",
         c"When ON, compatible regex patterns use the Rust regex crate for thread-safe parallel execution",
         &PARALLEL_REGEX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.allow_compress_open_partition",
+        c"Allow compressing a partition whose time range has not closed yet",
+        c"Compressed partitions are read-only. OFF (default) makes deltax_compress_partition refuse a partition that is still receiving rows; ON is for tests and for backfills of data that has stopped arriving.",
+        &ALLOW_COMPRESS_OPEN_PARTITION,
         GucContext::Userset,
         GucFlags::default(),
     );

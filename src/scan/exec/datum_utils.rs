@@ -1548,46 +1548,76 @@ pub(super) unsafe fn collation_strcmp(a: &str, b: &str) -> i32 {
     }
 }
 
+/// True when a stored UTF-8 payload *is already* a valid varlena body for
+/// `type_oid`, so a Datum can be made by wrapping the bytes in a varlena header.
+///
+/// Only `text` and `varchar` qualify. Every other type that the compressor
+/// routes through [`ColumnKind::Text`] — `numeric`, `uuid`, `bpchar`, `inet`,
+/// domains over text, … — stores the *output* of its own out function, and the
+/// only way back to a Datum is the type's input function.
+///
+/// Getting this predicate wrong is not a slow path, it is wrong data: a
+/// `numeric` payload wrapped as a varlena is read by `numeric_out` as
+/// base-10000 digits, which is how a billing ledger came back with 61 thousand
+/// digits per row in July 2026. Widen the list only for a type whose text form
+/// is byte-identical to its varlena body.
+#[inline]
+pub(super) fn str_payload_is_varlena_body(type_oid: pg_sys::Oid) -> bool {
+    type_oid == pg_sys::TEXTOID || type_oid == pg_sys::VARCHAROID
+}
+
+/// Same question for payloads handed over as raw bytes instead of `&str`.
+///
+/// Adds `jsonb`: the compressor stores jsonb as its binary varlena body (not
+/// UTF-8 text), so those bytes are wrapped directly and must never reach
+/// `jsonb_in`. See [`byte_slices_to_jsonb_datums_arena`].
+#[inline]
+pub(super) fn byte_payload_is_varlena_body(type_oid: pg_sys::Oid) -> bool {
+    str_payload_is_varlena_body(type_oid) || type_oid == pg_sys::JSONBOID
+}
+
+/// Build a Datum of `type_oid` from the stored text form of a value.
 pub(super) unsafe fn str_to_text_datum(
     s: &str,
     type_oid: pg_sys::Oid,
     typmod: i32,
 ) -> pg_sys::Datum {
     unsafe {
-        // bpchar needs the type input function for padding; jsonb stores
-        // as canonical text and needs the input function to produce a real
-        // jsonb binary Datum (otherwise jsonb operators segfault).
-        if type_oid == pg_sys::BPCHAROID || type_oid == pg_sys::JSONBOID {
+        if str_payload_is_varlena_body(type_oid) {
+            // text/varchar: direct varlena construction (avoids type input function lookup)
+            let text = pg_sys::cstring_to_text_with_len(s.as_ptr() as *const _, s.len() as i32);
+            pg_sys::Datum::from(text as usize)
+        } else {
+            // Everything else goes through the type's input function: bpchar for
+            // blank padding, jsonb to get a binary jsonb Datum, numeric/uuid/…
+            // because their text form is not their varlena body.
             let cstr = std::ffi::CString::new(s).unwrap();
             let mut typinput: pg_sys::Oid = pg_sys::InvalidOid;
             let mut typioparam: pg_sys::Oid = pg_sys::InvalidOid;
             pg_sys::getTypeInputInfo(type_oid, &mut typinput, &mut typioparam);
             pg_sys::OidInputFunctionCall(typinput, cstr.as_ptr() as *mut _, typioparam, typmod)
-        } else {
-            // text/varchar: direct varlena construction (avoids type input function lookup)
-            let text = pg_sys::cstring_to_text_with_len(s.as_ptr() as *const _, s.len() as i32);
-            pg_sys::Datum::from(text as usize)
         }
     }
 }
 
-/// Allocate text/varchar datums from string slices using a single contiguous allocation.
+/// Allocate datums from string slices using a single contiguous allocation.
 ///
 /// Instead of N individual palloc calls (one per string), this allocates one
 /// large block and packs all varlena headers + string data sequentially.
 /// This dramatically improves cache locality during the per-row emit loop.
 ///
-/// For bpchar, falls back to per-string allocation (needs type input function for padding).
+/// Only text/varchar can take that shortcut; any other type falls back to the
+/// per-string input-function path ([`str_to_text_datum`]).
 pub(super) unsafe fn str_slices_to_text_datums_arena(
     slices: &[&str],
     type_oid: pg_sys::Oid,
     typmod: i32,
 ) -> Vec<pg_sys::Datum> {
-    // bpchar needs the input function for padding. jsonb should normally go
-    // through `byte_slices_to_jsonb_datums_arena` (the bytes are binary, not
-    // UTF-8); this branch is only a safety net for any caller that still
-    // hands us text.
-    if type_oid == pg_sys::BPCHAROID || type_oid == pg_sys::JSONBOID {
+    if !str_payload_is_varlena_body(type_oid) {
+        // bpchar needs the input function for padding; numeric/uuid/… need it to
+        // become a Datum of their own type at all. jsonb should normally arrive
+        // via `byte_slices_to_jsonb_datums_arena` (the bytes are binary, not
+        // UTF-8); reaching here it is re-parsed, which is correct if slower.
         return unsafe {
             slices
                 .iter()
@@ -1692,12 +1722,12 @@ unsafe fn ranges_to_varlena_datums(buf: &[u8], ranges: &[(usize, usize)]) -> Vec
     }
 }
 
-/// Build text/varchar/jsonb/bpchar Datums from decompressed `(buf, ranges)`.
+/// Build Datums from decompressed `(buf, ranges)`.
 ///
 /// text/varchar/jsonb take the zero-validation arena path
-/// ([`ranges_to_varlena_datums`]). bpchar still needs the type input function
-/// for blank-padding, so it falls back to the per-string path (and is the only
-/// case that pays UTF-8 validation).
+/// ([`ranges_to_varlena_datums`]) because their stored bytes already are the
+/// varlena body. Everything else (bpchar padding, numeric, uuid, …) goes
+/// through the type input function per value.
 unsafe fn text_ranges_to_datums(
     buf: &[u8],
     ranges: &[(usize, usize)],
@@ -1705,7 +1735,9 @@ unsafe fn text_ranges_to_datums(
     typmod: i32,
 ) -> Vec<pg_sys::Datum> {
     unsafe {
-        if type_oid == pg_sys::BPCHAROID {
+        if byte_payload_is_varlena_body(type_oid) {
+            ranges_to_varlena_datums(buf, ranges)
+        } else {
             ranges
                 .iter()
                 .map(|&(off, len)| {
@@ -1714,18 +1746,17 @@ unsafe fn text_ranges_to_datums(
                     str_to_text_datum(s, type_oid, typmod)
                 })
                 .collect()
-        } else {
-            ranges_to_varlena_datums(buf, ranges)
         }
     }
 }
 
 /// Selection-aware variant of [`text_ranges_to_datums`]: build datums only for
 /// rows where `nn_selection[i]` is true (in order, for `merge_with_placeholder`).
-/// Skips UTF-8 validation for text/varchar (PG stores raw bytes); only bpchar
-/// pays the input function + validation. Avoids materializing a `Vec<&str>` over
-/// the whole column — important for the monolithic Lz4 path, which otherwise
-/// validates every row just to keep the (often few) matching ones.
+/// Skips UTF-8 validation for text/varchar/jsonb (the stored bytes are the
+/// varlena body); other types pay the input function + validation. Avoids
+/// materializing a `Vec<&str>` over the whole column — important for the
+/// monolithic Lz4 path, which otherwise validates every row just to keep the
+/// (often few) matching ones.
 unsafe fn matched_text_ranges_to_datums(
     buf: &[u8],
     ranges: &[(usize, usize)],
@@ -1734,7 +1765,15 @@ unsafe fn matched_text_ranges_to_datums(
     typmod: i32,
 ) -> Vec<pg_sys::Datum> {
     unsafe {
-        if type_oid == pg_sys::BPCHAROID {
+        if byte_payload_is_varlena_body(type_oid) {
+            let matched: Vec<&[u8]> = ranges
+                .iter()
+                .zip(nn_selection.iter())
+                .filter(|&(_, &sel)| sel)
+                .map(|(&(off, len), _)| &buf[off..off + len])
+                .collect();
+            varlena_arena_alloc(&matched)
+        } else {
             ranges
                 .iter()
                 .zip(nn_selection.iter())
@@ -1745,14 +1784,6 @@ unsafe fn matched_text_ranges_to_datums(
                     str_to_text_datum(s, type_oid, typmod)
                 })
                 .collect()
-        } else {
-            let matched: Vec<&[u8]> = ranges
-                .iter()
-                .zip(nn_selection.iter())
-                .filter(|&(_, &sel)| sel)
-                .map(|(&(off, len), _)| &buf[off..off + len])
-                .collect();
-            varlena_arena_alloc(&matched)
         }
     }
 }

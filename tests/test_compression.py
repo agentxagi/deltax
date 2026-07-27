@@ -95,6 +95,48 @@ class TestEnableCompression:
 
 
 class TestCompressDecompress:
+    def test_open_partition_is_refused_by_default(self, db):
+        """Sealing the partition that is still taking rows has to be opt-in.
+
+        A compressed partition is read-only, so compressing the one whose range
+        has not closed yet turns every subsequent insert into an error — which is
+        how a billing table went read-only mid-month in June 2026. The rest of
+        this suite runs with `pg_deltax.allow_compress_open_partition = on`
+        (set in `conftest.py`); this test turns it off to check the default.
+        """
+        setup_metrics_table(db)
+        insert_metrics(db, n_devices=2, n_points=5)
+        db.execute(
+            "SELECT deltax.deltax_enable_compression('metrics', "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+
+        # A partition whose range_end is in the future = still open.
+        part_name = db.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
+            "WHERE range_end > now() ORDER BY range_end LIMIT 1"
+        ).fetchone()
+        if part_name is None:
+            pytest.skip("no open partition in the fixture data")
+        part_name = part_name[0]
+
+        db.execute("SET pg_deltax.allow_compress_open_partition = off")
+        with pytest.raises(Exception) as excinfo:
+            db.execute(
+                f"SELECT deltax.deltax_compress_partition('{part_name}')"
+            )
+        db.rollback()
+        assert "open partition" in str(excinfo.value)
+
+        # With the override the same call goes through.
+        db.execute("SET pg_deltax.allow_compress_open_partition = on")
+        result = db.execute(
+            f"SELECT deltax.deltax_compress_partition('{part_name}')"
+        ).fetchone()[0]
+        db.commit()
+        assert "Compressed" in result
+
     def test_compress_partition(self, db):
         """Compress a partition and verify it's empty + companion exists."""
         setup_metrics_table(db)
