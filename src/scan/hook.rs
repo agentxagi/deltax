@@ -4961,14 +4961,21 @@ unsafe fn lookup_companion_from_subpath(
             return None;
         }
         let rti = (*parent).relid;
-        if rti == 0 {
+        if rti == 0 || (rti as i32) >= (*root).simple_rel_array_size {
             return None;
         }
         let rte = *(*root).simple_rte_array.add(rti as usize);
         if rte.is_null() {
             return None;
         }
+        // Only a relation RTE carries a table OID; subqueries and views carry 0.
+        if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
+            return None;
+        }
         let child_oid = (*rte).relid;
+        if child_oid == pg_sys::InvalidOid {
+            return None;
+        }
         let companion_oid = cached_companion_for_rel(child_oid);
         if companion_oid != pg_sys::InvalidOid {
             Some(companion_oid)
@@ -4983,22 +4990,43 @@ unsafe fn lookup_companion_from_subpath(
 /// Opens the relation and checks the actual block count via smgr,
 /// which reflects the true on-disk state (not the stale pg_class.relpages
 /// that only updates during VACUUM/ANALYZE).
+///
+/// **Returns `true` whenever it cannot decide.** The caller uses this answer to
+/// give up on `DeltaXAppend`; claiming "empty" for a path we failed to read would
+/// make the optimisation skip real rows. Erring towards "has data" only costs the
+/// optimisation.
+///
+/// The previous version returned `false` for the unknown case and, worse, called
+/// `table_open` with the RTE's `relid` without checking it was a relation RTE.
+/// For a subquery or a view that `relid` is 0, and `table_open(0)` aborts the
+/// query at planning time with `could not open relation with OID 0` — in *any*
+/// query of the shape `count(...)` over a `UNION ALL` of subqueries, with no
+/// deltax table involved and even in a database where the extension was never
+/// created. That is how SPARQL aggregation inside `GRAPH` (pg_ripple) spent
+/// months looking like a pg_ripple defect.
 unsafe fn subpath_has_data(root: *mut pg_sys::PlannerInfo, subpath: *const pg_sys::Path) -> bool {
     unsafe {
         let parent = (*subpath).parent;
         if parent.is_null() {
-            return false;
+            return true;
         }
         // RelOptInfo.relid is the range table index (RTI)
         let rti = (*parent).relid;
-        if rti == 0 {
-            return false;
+        if rti == 0 || (rti as i32) >= (*root).simple_rel_array_size {
+            return true;
         }
         let rte = *(*root).simple_rte_array.add(rti as usize);
         if rte.is_null() {
-            return false;
+            return true;
+        }
+        // Subquery, CTE, function, VALUES: there is no heap to measure.
+        if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
+            return true;
         }
         let rel_oid = (*rte).relid;
+        if rel_oid == pg_sys::InvalidOid {
+            return true;
+        }
         // Open relation and check actual block count via smgr
         let rel = pg_sys::table_open(rel_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let nblocks =
@@ -5052,6 +5080,11 @@ unsafe fn extract_oids_from_custom_path(
 /// for the DeltaXAppend correctness check.
 pub(crate) unsafe fn relation_heap_is_empty(oid: pg_sys::Oid) -> bool {
     unsafe {
+        // Invalid OID: nothing to measure. "Not empty" is the safe direction,
+        // because the caller uses this to decide whether it may skip the partition.
+        if oid == pg_sys::InvalidOid {
+            return false;
+        }
         let rel = pg_sys::table_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let nblocks =
             pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
