@@ -4183,6 +4183,7 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                 &mut state.segments_data[seg_idx],
             );
             state.timing.heap_scan_us += fetch_us;
+            assert_needed_blobs_present(state, seg_idx);
             let seg = &state.segments_data[seg_idx];
 
             // Dictionary-based LIKE pruning
@@ -4875,6 +4876,47 @@ pub(super) unsafe extern "C-unwind" fn shutdown_deltax_append(node: *mut pg_sys:
 // ============================================================================
 
 /// Fill a TupleTableSlot from pre-computed datums at the current row cursor.
+/// Fail with a diagnosable error when a segment's `_meta` row exists but the
+/// `_blobs` row for a column the query needs does not.
+///
+/// The companion tables are three separate heaps; anything that fills them out
+/// of step — a logical-replication stream still catching up, a restore that
+/// copied `_meta` but not `_blobs`, a manual DELETE — leaves a segment claiming
+/// N rows with nothing to decompress. Without this check the column decodes to
+/// an empty vector and the scan panics on `column[row_cursor]`
+/// ("index out of bounds: the len is 0 but the index is 0"), which says nothing
+/// about which table is short.
+unsafe fn assert_needed_blobs_present(state: &DecompressState, seg_idx: usize) {
+    let seg = &state.segments_data[seg_idx];
+    if seg.row_count == 0 {
+        return;
+    }
+    for (col_idx, needed) in state.needed_cols.iter().enumerate() {
+        if !needed {
+            continue;
+        }
+        let Some(slot) = state.blob_idx[col_idx] else {
+            continue; // segment_by value or column added after compression
+        };
+        let slot = slot as usize;
+        let missing = match seg.compressed_blobs.get(slot) {
+            None => true,
+            Some(b) => b.is_empty(),
+        };
+        if missing {
+            pgrx::error!(
+                "pg_deltax: compressed segment {} (companion oid {}) has no blob for column \
+                 \"{}\", but its _meta row claims {} rows. The companion tables are out of \
+                 step: _blobs is missing rows that _meta references.",
+                seg.segment_id,
+                seg.companion_oid.to_u32(),
+                state.col_names[col_idx],
+                seg.row_count
+            );
+        }
+    }
+}
+
 unsafe fn fill_slot(slot: *mut pg_sys::TupleTableSlot, state: &DecompressState) {
     unsafe {
         pg_sys::ExecClearTuple(slot);
