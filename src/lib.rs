@@ -248,6 +248,27 @@ ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS max_segment_id INT;
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS has_loose_rows BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS has_tombstones BOOLEAN NOT NULL DEFAULT false;
 
+-- These two tables are the map to the compressed data, and pg_dump must carry
+-- them or a restore is silently wrong.
+--
+-- `deltax_deltatable` and `deltax_partition` are created by the extension, so
+-- they belong to it, and pg_dump skips the contents of extension-owned tables
+-- unless the extension marks them as configuration — even when the user names
+-- them with `--table`. The companion tables under `_deltax_compressed` are
+-- created at runtime, are NOT extension members, and therefore DO get dumped
+-- with all the compressed data in them.
+--
+-- The result is the worst kind of failure: after a restore the compressed data
+-- is all there but unreachable, and no error is raised. Measured on a 176.565-row
+-- table with two compressed partitions: `SELECT count(*)` returned 21.540 after
+-- restore — 87,8% of the rows invisible, reported as if it were the total.
+-- Re-inserting the 12 catalog rows brought it back to 175.016. `pg_upgrade` is
+-- unaffected (it copies files, catalog included); every logical dump is.
+SELECT pg_extension_config_dump('deltax.deltax_deltatable', '');
+SELECT pg_extension_config_dump('deltax.deltax_deltatable_id_seq', '');
+SELECT pg_extension_config_dump('deltax.deltax_partition', '');
+SELECT pg_extension_config_dump('deltax.deltax_partition_id_seq', '');
+
 CREATE OR REPLACE FUNCTION deltax.deltax_reject_compressed_partition_dml()
 RETURNS trigger
 LANGUAGE plpgsql
