@@ -555,7 +555,7 @@ unsafe fn check_time_pathkey(
 
         #[cfg(feature = "pg17")]
         let is_asc = (*first_pk).pk_strategy == pg_sys::BTLessStrategyNumber as i32;
-        #[cfg(feature = "pg18")]
+        #[cfg(feature = "pg18_plus")]
         let is_asc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_LT;
 
         if !is_asc {
@@ -765,12 +765,12 @@ unsafe fn extract_topn_info(
 
         #[cfg(feature = "pg17")]
         let is_asc = (*first_pk).pk_strategy == pg_sys::BTLessStrategyNumber as i32;
-        #[cfg(feature = "pg18")]
+        #[cfg(feature = "pg18_plus")]
         let is_asc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_LT;
 
         #[cfg(feature = "pg17")]
         let is_desc = (*first_pk).pk_strategy == pg_sys::BTGreaterStrategyNumber as i32;
-        #[cfg(feature = "pg18")]
+        #[cfg(feature = "pg18_plus")]
         let is_desc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_GT;
 
         if !is_asc && !is_desc {
@@ -804,6 +804,14 @@ unsafe fn extract_topn_info(
 /// this into the child partition's `pg_class.reltuples`, so use the cheap
 /// syscache value first and otherwise fall back to a companion-meta estimate,
 /// avoiding the exact DeltaX catalog SPI lookup during planning.
+///
+/// PG19 removed `get_relation_info_hook` and added `build_simple_rel_hook` in its
+/// place (upstream 91f33a2ae, "better-placed hook"). O corpo é o mesmo: o hook novo
+/// roda em `build_simple_rel()` logo DEPOIS de `get_relation_info()`, que é a mesma
+/// janela de que este código depende — antes de `set_baserel_size_estimates`. Só o
+/// ponto de entrada e o encadeamento do hook anterior mudam, então o corpo mora em
+/// `deltax_patch_rel_estimates` e cada versão tem sua casca.
+#[cfg(not(feature = "pg19"))]
 #[pg_guard]
 pub unsafe extern "C-unwind" fn deltax_get_relation_info(
     root: *mut pg_sys::PlannerInfo,
@@ -827,6 +835,50 @@ pub unsafe extern "C-unwind" fn deltax_get_relation_info(
                 f(root, relation_object_id, inh_parent, rel);
             }
         }
+        deltax_patch_rel_estimates(relation_object_id, inh_parent, rel);
+    }
+}
+
+/// PG19: `build_simple_rel_hook(root, rel, rte)`. O OID e o sinalizador de
+/// herança que o hook antigo recebia como argumento saem do `rte`
+/// (`rte->relid`, `rte->inh`) — são os mesmos valores que o
+/// `get_relation_info()` acabou de receber duas dezenas de linhas antes.
+#[cfg(feature = "pg19")]
+#[pg_guard]
+pub unsafe extern "C-unwind" fn deltax_build_simple_rel(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+    rte: *mut pg_sys::RangeTblEntry,
+) {
+    unsafe {
+        let prev = PREV_GET_RELATION_INFO_HOOK.load(Ordering::SeqCst);
+        if !prev.is_null() {
+            let prev_fn: pg_sys::build_simple_rel_hook_type = Some(std::mem::transmute::<
+                *mut (),
+                unsafe extern "C-unwind" fn(
+                    *mut pg_sys::PlannerInfo,
+                    *mut pg_sys::RelOptInfo,
+                    *mut pg_sys::RangeTblEntry,
+                ),
+            >(prev));
+            if let Some(f) = prev_fn {
+                f(root, rel, rte);
+            }
+        }
+        if rte.is_null() {
+            return;
+        }
+        let _ = root;
+        deltax_patch_rel_estimates((*rte).relid, (*rte).inh, rel);
+    }
+}
+
+unsafe fn deltax_patch_rel_estimates(
+    relation_object_id: pg_sys::Oid,
+    inh_parent: bool,
+    rel: *mut pg_sys::RelOptInfo,
+) {
+    unsafe {
         let _profile = super::plan_profile::scope("get_relation_info");
 
         // Only interested in base relations (partitioned children show
@@ -6228,7 +6280,7 @@ pub unsafe extern "C-unwind" fn deltax_executor_run(
 }
 
 /// ExecutorRun hook (PG 18 signature — `execute_once` was removed).
-#[cfg(feature = "pg18")]
+#[cfg(feature = "pg18_plus")]
 #[pg_guard]
 pub unsafe extern "C-unwind" fn deltax_executor_run(
     query_desc: *mut pg_sys::QueryDesc,
@@ -6301,12 +6353,44 @@ unsafe fn call_prev_executor_start(query_desc: *mut pg_sys::QueryDesc, eflags: c
 /// `set_customscan_references` already rewrote the scan's tlist to
 /// `Var(INDEX_VAR, …)` by then — `tlist_member` (equal()) doesn't match
 /// `Expr` to `Var`. So we do the matching ourselves on the final plan tree.
+/// O PG19 acrescentou `es: *mut ExplainState` ao `planner_hook` e ao
+/// `standard_planner` (o EXPLAIN passa o próprio estado para o planejador).
+/// `PlannerExplainState` é esse ponteiro no PG19 e `()` nas versões anteriores,
+/// então o corpo do hook é um só e apenas o repasse muda.
+#[cfg(feature = "pg19")]
+pub type PlannerExplainState = *mut pg_sys::ExplainState;
+#[cfg(not(feature = "pg19"))]
+pub type PlannerExplainState = ();
+
+#[cfg(not(feature = "pg19"))]
 #[pg_guard]
 pub unsafe extern "C-unwind" fn deltax_planner(
     parse: *mut pg_sys::Query,
     query_string: *const std::ffi::c_char,
     cursor_options: c_int,
     bound_params: pg_sys::ParamListInfo,
+) -> *mut pg_sys::PlannedStmt {
+    unsafe { deltax_planner_body(parse, query_string, cursor_options, bound_params, ()) }
+}
+
+#[cfg(feature = "pg19")]
+#[pg_guard]
+pub unsafe extern "C-unwind" fn deltax_planner(
+    parse: *mut pg_sys::Query,
+    query_string: *const std::ffi::c_char,
+    cursor_options: c_int,
+    bound_params: pg_sys::ParamListInfo,
+    es: *mut pg_sys::ExplainState,
+) -> *mut pg_sys::PlannedStmt {
+    unsafe { deltax_planner_body(parse, query_string, cursor_options, bound_params, es) }
+}
+
+unsafe fn deltax_planner_body(
+    parse: *mut pg_sys::Query,
+    query_string: *const std::ffi::c_char,
+    cursor_options: c_int,
+    bound_params: pg_sys::ParamListInfo,
+    es: PlannerExplainState,
 ) -> *mut pg_sys::PlannedStmt {
     unsafe {
         let outer_profile = super::plan_profile::begin();
@@ -6337,15 +6421,39 @@ pub unsafe extern "C-unwind" fn deltax_planner(
         let prev = PREV_PLANNER_HOOK.load(Ordering::SeqCst);
         let standard_start = std::time::Instant::now();
         let pstmt: *mut pg_sys::PlannedStmt = if !prev.is_null() {
-            let prev_fn: unsafe extern "C-unwind" fn(
-                *mut pg_sys::Query,
-                *const std::ffi::c_char,
-                c_int,
-                pg_sys::ParamListInfo,
-            ) -> *mut pg_sys::PlannedStmt = std::mem::transmute(prev);
-            prev_fn(parse, query_string, cursor_options, bound_params)
+            #[cfg(not(feature = "pg19"))]
+            {
+                let prev_fn: unsafe extern "C-unwind" fn(
+                    *mut pg_sys::Query,
+                    *const std::ffi::c_char,
+                    c_int,
+                    pg_sys::ParamListInfo,
+                )
+                    -> *mut pg_sys::PlannedStmt = std::mem::transmute(prev);
+                let _ = es;
+                prev_fn(parse, query_string, cursor_options, bound_params)
+            }
+            #[cfg(feature = "pg19")]
+            {
+                let prev_fn: unsafe extern "C-unwind" fn(
+                    *mut pg_sys::Query,
+                    *const std::ffi::c_char,
+                    c_int,
+                    pg_sys::ParamListInfo,
+                    *mut pg_sys::ExplainState,
+                )
+                    -> *mut pg_sys::PlannedStmt = std::mem::transmute(prev);
+                prev_fn(parse, query_string, cursor_options, bound_params, es)
+            }
         } else {
-            pg_sys::standard_planner(parse, query_string, cursor_options, bound_params)
+            #[cfg(not(feature = "pg19"))]
+            {
+                pg_sys::standard_planner(parse, query_string, cursor_options, bound_params)
+            }
+            #[cfg(feature = "pg19")]
+            {
+                pg_sys::standard_planner(parse, query_string, cursor_options, bound_params, es)
+            }
         };
         super::plan_profile::record(
             if outer_profile {

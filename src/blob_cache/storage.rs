@@ -632,11 +632,21 @@ unsafe extern "C-unwind" fn my_shmem_startup_hook() {
             // tranche name. The locks themselves live inline in
             // BlobCacheCtl::shard_locks (already zero-initialised by
             // write_bytes above); we call LWLockInitialize on each one.
-            let tranche_id = pg_sys::LWLockNewTrancheId();
+            //
+            // PG19 folded the name into LWLockNewTrancheId() and dropped
+            // LWLockRegisterTranche() entirely: the name now lives in shared
+            // memory, so backends no longer have to re-register it.
+            #[cfg(not(feature = "pg19"))]
+            let tranche_id = {
+                let id = pg_sys::LWLockNewTrancheId();
+                pg_sys::LWLockRegisterTranche(id, SHMEM_NAME.as_ptr());
+                id
+            };
+            #[cfg(feature = "pg19")]
+            let tranche_id = pg_sys::LWLockNewTrancheId(SHMEM_NAME.as_ptr());
             (*ctl)
                 .lwlock_tranche_id
                 .store(tranche_id, Ordering::Relaxed);
-            pg_sys::LWLockRegisterTranche(tranche_id, SHMEM_NAME.as_ptr());
             for i in 0..shards {
                 pg_sys::LWLockInitialize(&mut (*ctl).shard_locks[i].lock, tranche_id);
             }
@@ -741,8 +751,14 @@ fn attach() -> bool {
             // Each backend re-registers the tranche name so it shows
             // up in error messages and pg_stat_activity. The id was
             // assigned in postmaster's shmem_startup_hook.
+            //
+            // No-op on PG19: the name went into shared memory with
+            // LWLockNewTrancheId(name), and LWLockRegisterTranche() is gone.
             let tranche_id = ctl.lwlock_tranche_id.load(Ordering::Relaxed);
+            #[cfg(not(feature = "pg19"))]
             pg_sys::LWLockRegisterTranche(tranche_id, SHMEM_NAME.as_ptr());
+            #[cfg(feature = "pg19")]
+            let _ = tranche_id;
             let base = (*CTL_PTR.get().unwrap() as *mut BlobCacheCtl) as *mut u8;
             let off = std::mem::offset_of!(BlobCacheCtl, shard_locks);
             let lock_array = base.add(off) as *mut pg_sys::LWLockPadded;
@@ -776,7 +792,7 @@ unsafe fn dsa_create_in_place_compat(
     tranche_id: i32,
 ) -> *mut pg_sys::dsa_area {
     unsafe {
-        #[cfg(any(feature = "pg17", feature = "pg18"))]
+        #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
         {
             pg_sys::dsa_create_in_place_ext(
                 place,
@@ -787,7 +803,7 @@ unsafe fn dsa_create_in_place_compat(
                 DSA_MAX_SEGMENT_SIZE,
             )
         }
-        #[cfg(not(any(feature = "pg17", feature = "pg18")))]
+        #[cfg(not(any(feature = "pg17", feature = "pg18", feature = "pg19")))]
         {
             pg_sys::dsa_create_in_place(place, size, tranche_id, std::ptr::null_mut())
         }

@@ -77,7 +77,7 @@ pub(in crate::scan) unsafe fn tupdesc_get_attr(
     unsafe { (*tupdesc).attrs.as_ptr().add(i) }
 }
 
-#[cfg(feature = "pg18")]
+#[cfg(feature = "pg18_plus")]
 #[inline]
 pub(in crate::scan) unsafe fn tupdesc_get_attr(
     tupdesc: pg_sys::TupleDesc,

@@ -9,6 +9,54 @@ use super::datum_utils::tupdesc_get_attr;
 use crate::compress::{encode_f32_to_i64, encode_f64_to_i64};
 use crate::compression;
 
+/// `index_beginscan` mudou de assinatura duas vezes seguidas:
+///   PG17  (heap, index, snapshot, nkeys, norderbys)
+///   PG18  + `IndexScanInstrumentation *instrument` antes de nkeys
+///   PG19  + `uint32 flags` no fim (bitmask de ScanOptions)
+///
+/// Todas as varreduras internas do deltax são de leitura comum, sem
+/// instrumentação de EXPLAIN e sem dica de relação somente-leitura, então
+/// passamos NULL e `SO_NONE` — o mesmo que o core passa quando não há hint.
+/// Concentrar aqui evita repetir três blocos `cfg` em sete pontos de chamada.
+#[inline]
+unsafe fn index_beginscan_compat(
+    heap: pg_sys::Relation,
+    index: pg_sys::Relation,
+    snapshot: pg_sys::Snapshot,
+    nkeys: std::ffi::c_int,
+    norderbys: std::ffi::c_int,
+) -> pg_sys::IndexScanDesc {
+    unsafe {
+        #[cfg(feature = "pg17")]
+        {
+            pg_sys::index_beginscan(heap, index, snapshot, nkeys, norderbys)
+        }
+        #[cfg(all(feature = "pg18_plus", not(feature = "pg19")))]
+        {
+            pg_sys::index_beginscan(
+                heap,
+                index,
+                snapshot,
+                std::ptr::null_mut(),
+                nkeys,
+                norderbys,
+            )
+        }
+        #[cfg(feature = "pg19")]
+        {
+            pg_sys::index_beginscan(
+                heap,
+                index,
+                snapshot,
+                std::ptr::null_mut(),
+                nkeys,
+                norderbys,
+                pg_sys::ScanOptions::SO_NONE as u32,
+            )
+        }
+    }
+}
+
 /// Cached colstats row for a single segment: min/max/sum/counts.
 struct CachedColStatsRow {
     min_encoded: i64,
@@ -190,11 +238,7 @@ unsafe fn lookup_segments_by_minmax_index(
                 pg_sys::Datum::from(value as usize),
             );
 
-            #[cfg(feature = "pg17")]
-            let scan = pg_sys::index_beginscan(cs_rel, idx_rel, snapshot, 2, 0);
-            #[cfg(feature = "pg18")]
-            let scan =
-                pg_sys::index_beginscan(cs_rel, idx_rel, snapshot, std::ptr::null_mut(), 2, 0);
+            let scan = index_beginscan_compat(cs_rel, idx_rel, snapshot, 2, 0);
             pg_sys::index_rescan(scan, skey.as_mut_ptr(), 2, std::ptr::null_mut(), 0);
 
             let mut this: std::collections::HashSet<i32> = std::collections::HashSet::new();
@@ -597,10 +641,7 @@ unsafe fn lookup_point_segments_by_minmax_index(
             pg_sys::Datum::from(value as usize),
         );
 
-        #[cfg(feature = "pg17")]
-        let scan = pg_sys::index_beginscan(cs_rel, idx_rel, snapshot, 2, 0);
-        #[cfg(feature = "pg18")]
-        let scan = pg_sys::index_beginscan(cs_rel, idx_rel, snapshot, std::ptr::null_mut(), 2, 0);
+        let scan = index_beginscan_compat(cs_rel, idx_rel, snapshot, 2, 0);
         pg_sys::index_rescan(scan, skey.as_mut_ptr(), 2, std::ptr::null_mut(), 0);
 
         let mut segments = Vec::new();
@@ -1840,17 +1881,7 @@ unsafe fn bloom_pruned_segment_ids(
                     pg_sys::Datum::from(bc.col_idx as i16),
                 );
 
-                #[cfg(feature = "pg17")]
-                let scan = pg_sys::index_beginscan(blooms_rel, idx_rel, snapshot, 1, 0);
-                #[cfg(feature = "pg18")]
-                let scan = pg_sys::index_beginscan(
-                    blooms_rel,
-                    idx_rel,
-                    snapshot,
-                    std::ptr::null_mut(),
-                    1,
-                    0,
-                );
+                let scan = index_beginscan_compat(blooms_rel, idx_rel, snapshot, 1, 0);
                 pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
 
                 let slot = pg_sys::table_slot_create(blooms_rel, std::ptr::null_mut());
@@ -3194,18 +3225,8 @@ pub(super) unsafe fn load_segments_heap(
                                     pg_sys::Datum::from(col_idx_val),
                                 );
 
-                                #[cfg(feature = "pg17")]
                                 let scan =
-                                    pg_sys::index_beginscan(cs_rel, idx_rel, cs_snapshot, 1, 0);
-                                #[cfg(feature = "pg18")]
-                                let scan = pg_sys::index_beginscan(
-                                    cs_rel,
-                                    idx_rel,
-                                    cs_snapshot,
-                                    std::ptr::null_mut(),
-                                    1,
-                                    0,
-                                );
+                                    index_beginscan_compat(cs_rel, idx_rel, cs_snapshot, 1, 0);
                                 pg_sys::index_rescan(
                                     scan,
                                     skey.as_mut_ptr(),
@@ -3444,17 +3465,7 @@ pub(super) unsafe fn load_segments_heap(
                             pg_sys::Datum::from(vc.col_idx as i16),
                         );
 
-                        #[cfg(feature = "pg17")]
-                        let scan = pg_sys::index_beginscan(vb_rel, idx_rel, snapshot, 1, 0);
-                        #[cfg(feature = "pg18")]
-                        let scan = pg_sys::index_beginscan(
-                            vb_rel,
-                            idx_rel,
-                            snapshot,
-                            std::ptr::null_mut(),
-                            1,
-                            0,
-                        );
+                        let scan = index_beginscan_compat(vb_rel, idx_rel, snapshot, 1, 0);
                         pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
 
                         let slot = pg_sys::table_slot_create(vb_rel, std::ptr::null_mut());
@@ -3623,17 +3634,7 @@ pub(super) unsafe fn load_segments_heap(
                             pg_sys::Datum::from(col_idx as i16),
                         );
 
-                        #[cfg(feature = "pg17")]
-                        let scan = pg_sys::index_beginscan(blob_rel, idx_rel, snapshot, 1, 0);
-                        #[cfg(feature = "pg18")]
-                        let scan = pg_sys::index_beginscan(
-                            blob_rel,
-                            idx_rel,
-                            snapshot,
-                            std::ptr::null_mut(),
-                            1,
-                            0,
-                        );
+                        let scan = index_beginscan_compat(blob_rel, idx_rel, snapshot, 1, 0);
                         pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
 
                         // Allocate slot for tuple extraction
@@ -3915,11 +3916,7 @@ pub(super) unsafe fn load_text_length_sidecars(
                     pg_sys::Datum::from(col_idx as i16),
                 );
 
-                #[cfg(feature = "pg17")]
-                let scan = pg_sys::index_beginscan(rel, idx_rel, snapshot, 1, 0);
-                #[cfg(feature = "pg18")]
-                let scan =
-                    pg_sys::index_beginscan(rel, idx_rel, snapshot, std::ptr::null_mut(), 1, 0);
+                let scan = index_beginscan_compat(rel, idx_rel, snapshot, 1, 0);
                 pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
 
                 let slot = pg_sys::table_slot_create(rel, std::ptr::null_mut());
@@ -4062,11 +4059,7 @@ pub(super) unsafe fn fetch_segment_blobs(
                 pg_sys::Datum::from(segment_id),
             );
 
-            #[cfg(feature = "pg17")]
-            let scan = pg_sys::index_beginscan(blob_rel, idx_rel, snapshot, 2, 0);
-            #[cfg(feature = "pg18")]
-            let scan =
-                pg_sys::index_beginscan(blob_rel, idx_rel, snapshot, std::ptr::null_mut(), 2, 0);
+            let scan = index_beginscan_compat(blob_rel, idx_rel, snapshot, 2, 0);
             pg_sys::index_rescan(scan, skeys.as_mut_ptr(), 2, std::ptr::null_mut(), 0);
 
             let slot = pg_sys::table_slot_create(blob_rel, std::ptr::null_mut());

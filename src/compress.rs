@@ -5585,23 +5585,61 @@ impl Drop for DmlBypassGuard {
     }
 }
 
+/// Compat: o PG19 renomeou toda a superfície de replication origin —
+/// `RepOriginId` virou `ReplOriginId`, `InvalidRepOriginId` virou
+/// `InvalidReplOriginId`, e a variável de backend `replorigin_session_origin`
+/// foi para dentro do struct `replorigin_xact_state` (campo `origin`).
+#[cfg(not(feature = "pg19"))]
+type OriginId = pg_sys::RepOriginId;
+#[cfg(feature = "pg19")]
+type OriginId = pg_sys::ReplOriginId;
+
+#[cfg(not(feature = "pg19"))]
+const INVALID_ORIGIN_ID: OriginId = pg_sys::InvalidRepOriginId as OriginId;
+#[cfg(feature = "pg19")]
+const INVALID_ORIGIN_ID: OriginId = pg_sys::InvalidReplOriginId as OriginId;
+
+#[inline]
+unsafe fn session_origin() -> OriginId {
+    #[cfg(not(feature = "pg19"))]
+    unsafe {
+        pg_sys::replorigin_session_origin
+    }
+    #[cfg(feature = "pg19")]
+    unsafe {
+        pg_sys::replorigin_xact_state.origin
+    }
+}
+
+#[inline]
+unsafe fn set_session_origin(id: OriginId) {
+    #[cfg(not(feature = "pg19"))]
+    unsafe {
+        pg_sys::replorigin_session_origin = id;
+    }
+    #[cfg(feature = "pg19")]
+    unsafe {
+        pg_sys::replorigin_xact_state.origin = id;
+    }
+}
+
 /// Backend-local cache of the `deltax_internal` replication-origin id.
-/// `InvalidRepOriginId` (0) means "not found" — the guard then no-ops.
-fn internal_origin_id() -> pg_sys::RepOriginId {
+/// An invalid id (0) means "not found" — the guard then no-ops.
+fn internal_origin_id() -> OriginId {
     thread_local! {
-        static ID: std::cell::Cell<pg_sys::RepOriginId> =
-            const { std::cell::Cell::new(pg_sys::InvalidRepOriginId as pg_sys::RepOriginId) };
+        static ID: std::cell::Cell<OriginId> =
+            const { std::cell::Cell::new(INVALID_ORIGIN_ID) };
     }
     ID.with(|c| {
         let cached = c.get();
-        if cached != pg_sys::InvalidRepOriginId as pg_sys::RepOriginId {
+        if cached != INVALID_ORIGIN_ID {
             return cached;
         }
         // Look up by name at the C level (no SQL-function ACL; the origin is
-        // created in the extension SQL). `missing_ok = true` returns
-        // InvalidRepOriginId rather than erroring when absent.
+        // created in the extension SQL). `missing_ok = true` returns an
+        // invalid id rather than erroring when absent.
         let id = unsafe { pg_sys::replorigin_by_name(c"deltax_internal".as_ptr(), true) };
-        if id != pg_sys::InvalidRepOriginId as pg_sys::RepOriginId {
+        if id != INVALID_ORIGIN_ID {
             c.set(id);
         }
         id
@@ -5616,27 +5654,27 @@ fn internal_origin_id() -> pg_sys::RepOriginId {
 /// using the default `origin = any` receive the tagged changes normally, so
 /// tagging is safe for both replication topologies (see COMPRESSED_DML.md §7).
 ///
-/// Sets the backend-local `replorigin_session_origin` directly rather than via
+/// Sets the backend-local session origin directly rather than via
 /// `replorigin_session_setup`: we only need per-record WAL tagging, not the
 /// exclusive progress slot session_setup reserves (which would serialize
 /// concurrent internal writers). Nests safely (save/restore).
 struct InternalOriginGuard {
-    prev: pg_sys::RepOriginId,
+    prev: OriginId,
 }
 
 impl InternalOriginGuard {
     fn new() -> Self {
-        let prev = unsafe { pg_sys::replorigin_session_origin };
+        let prev = unsafe { session_origin() };
         // If the origin is absent, id is Invalid → this is a no-op (records
         // stay untagged), preserving today's behavior.
-        unsafe { pg_sys::replorigin_session_origin = internal_origin_id() };
+        unsafe { set_session_origin(internal_origin_id()) };
         InternalOriginGuard { prev }
     }
 }
 
 impl Drop for InternalOriginGuard {
     fn drop(&mut self) {
-        unsafe { pg_sys::replorigin_session_origin = self.prev };
+        unsafe { set_session_origin(self.prev) };
     }
 }
 
