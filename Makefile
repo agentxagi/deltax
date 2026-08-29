@@ -28,6 +28,7 @@ DOCKER_RUN_FLAGS ?=
        bench-clickbench bench-clickbench-keep bench-clickbench-full bench-clean \
        bench-rtabench bench-rtabench-bless bench-rtabench-keep bench-rtabench-full \
        bench-rtabench-clean bench-rtabench-distclean \
+       bench-dml bench-dml-keep bench-dml-bless \
        bench-timescaledb bench-compare bench-all \
        run-sql run-sql-file logs logs-all logs-follow release
 
@@ -273,6 +274,22 @@ bench-rtabench-full: $(VENV)/.stamp image
 bench-rtabench-keep: $(VENV)/.stamp image bench-rtabench-clean
 	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) KEEP_CONTAINER=1 BENCH_PERSIST=1 \
 		$(VENV)/bin/pytest tests/bench_rtabench.py -v -s
+
+# DML write-latency benchmark (INSERT/UPDATE/DELETE on compressed partitions)
+# vs a plain-PG twin, plus the read-after-write pushdown cliff. Reuses the
+# rtabench twin-table loader; measures warm, rollback-isolated latency. See
+# tests/bench_dml.py. Results archived to tests/.bench_results/history/.
+bench-dml: $(VENV)/.stamp image
+	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) $(VENV)/bin/pytest tests/bench_dml.py -v -s
+
+# Keep the container + DB up afterwards (poke at plans / dirty state).
+bench-dml-keep: $(VENV)/.stamp image bench-rtabench-clean
+	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) KEEP_CONTAINER=1 BENCH_PERSIST=1 \
+		$(VENV)/bin/pytest tests/bench_dml.py -v -s
+
+# Record the current warm DML latencies as the pinned regression baseline.
+bench-dml-bless: $(VENV)/.stamp image
+	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) DML_BLESS=1 $(VENV)/bin/pytest tests/bench_dml.py -v -s
 
 # Wipe the container and persistent PG data volume. The downloaded CSV
 # cache (tests/.data/rtabench) is preserved — use `bench-rtabench-distclean`

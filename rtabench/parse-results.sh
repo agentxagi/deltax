@@ -35,7 +35,7 @@ while IFS= read -r line; do
     elif [[ "$line" =~ Time:\ ([0-9.]+)\ ms ]]; then
         secs=$(echo "${BASH_REMATCH[1]} / 1000" | bc -l | xargs printf '%.3f')
         timings+=("$secs")
-    elif [[ "$line" =~ psql:\ error ]]; then
+    elif [[ "$line" =~ psql:\ error ]] || [[ "$line" == "QUERY_ERROR" ]]; then
         timings+=("null")
     fi
 done

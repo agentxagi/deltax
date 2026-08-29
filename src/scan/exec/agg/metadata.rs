@@ -228,7 +228,7 @@ pub(super) fn try_metadata_fast_path(
             if seg.row_count == 0 {
                 continue;
             }
-            match classify_segment_quals(seg, batch_quals, &meta.col_names) {
+            match classify_segment_quals(seg, batch_quals, &meta.col_names, &meta.time_column) {
                 SegmentQualResult::AllPass => ap.push(seg),
                 SegmentQualResult::NonePass => {} // skip — no rows pass
                 SegmentQualResult::Ambiguous => amb.push(seg),

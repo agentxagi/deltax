@@ -82,44 +82,56 @@ def _rtabench_case(name: str):
         ("copy_csv_mixed_s25", "copy_csv", 25),
     ),
 )
-def test_rtabench_compressed_partition_rejects_parent_routed_insert(
+def test_rtabench_compressed_partition_accepts_parent_routed_insert(
     db,
     layout_name,
     load_path,
     segment_size,
 ):
+    # P1 transparent DML: a plain INSERT routed through the parent into a
+    # compressed partition succeeds — the row lands in the partition heap
+    # (the "loose row" region) and every read path unions it with the
+    # segment data.
     plain_table, deltax_table = create_rtabench_synthetic_pair(
         db,
         deltax_table=f"rtabench_events_{layout_name}",
         load_path=load_path,
         segment_size=segment_size,
     )
-    with pytest.raises(Exception, match="compressed partition"):
-        db.execute(
-            f"""
-            INSERT INTO {deltax_table} (
-                order_id,
-                counter,
-                event_created,
-                event_type,
-                satisfaction,
-                processor,
-                backup_processor,
-                event_payload
-            )
-            VALUES (
-                181,
-                9001,
-                '2024-05-04 12:00:00+00',
-                'Delivered',
-                4.5,
-                'proc-a',
-                'proc-b',
-                '{{}}'::jsonb
-            )
-            """
+    insert_template = """
+        INSERT INTO {table} (
+            order_id,
+            counter,
+            event_created,
+            event_type,
+            satisfaction,
+            processor,
+            backup_processor,
+            event_payload
         )
-    db.rollback()
+        VALUES (
+            181,
+            9001,
+            '2024-05-04 12:00:00+00',
+            'Delivered',
+            4.5,
+            'proc-a',
+            'proc-b',
+            '{{}}'::jsonb
+        )
+    """
+    db.execute(insert_template.format(table=deltax_table))
+    db.execute(insert_template.format(table=plain_table))
+    db.commit()
+
+    # The loose row must be visible through the deltax read path.
+    visible = db.execute(
+        f"SELECT count(*) FROM {deltax_table} WHERE counter = 9001"
+    ).fetchone()[0]
+    assert visible == 1
+    deltax_total = db.execute(f"SELECT count(*) FROM {deltax_table}").fetchone()[0]
+    plain_total = db.execute(f"SELECT count(*) FROM {plain_table}").fetchone()[0]
+    assert deltax_total == plain_total
 
     assert_query_case(
         db,
@@ -148,17 +160,66 @@ def test_rtabench_compressed_partition_rejects_parent_routed_insert(
             """,
         ),
     ),
+    ids=("update", "delete"),
 )
-def test_rtabench_compressed_partition_rejects_parent_routed_update_delete(
+def test_rtabench_compressed_partition_accepts_parent_routed_update_delete(
     rtabench_synthetic,
     db,
     operation,
     sql_template,
 ):
-    _, deltax_table, _, _ = rtabench_synthetic
-    with pytest.raises(Exception, match="compressed partition"):
-        db.execute(sql_template.format(table=deltax_table))
-    db.rollback()
+    # P2 transparent DML: UPDATE/DELETE routed through the parent into
+    # compressed partitions succeeds — affected segment rows are rewritten
+    # (UPDATE) or removed via tombstones/decompose (DELETE), and every read
+    # path keeps matching plain PostgreSQL. order_id=1 rows all live in the
+    # compressed 2024-05-02 partition.
+    plain_table, deltax_table, _, _ = rtabench_synthetic
+
+    deltax_rowcount = db.execute(sql_template.format(table=deltax_table)).rowcount
+    plain_rowcount = db.execute(sql_template.format(table=plain_table)).rowcount
+    assert deltax_rowcount == plain_rowcount
+    assert deltax_rowcount > 0
+    db.commit()
+
+    row_query = """
+        SELECT order_id, counter, event_created, event_type, satisfaction
+        FROM {table}
+        WHERE order_id = 1
+        ORDER BY event_created, satisfaction
+    """
+    plain_rows = db.execute(row_query.format(table=plain_table)).fetchall()
+    deltax_rows = db.execute(row_query.format(table=deltax_table)).fetchall()
+    if operation == "update":
+        # The changed values must be visible through the deltax read path.
+        assert len(plain_rows) == plain_rowcount
+        assert deltax_rows == plain_rows
+    else:
+        # The rows must be gone from both tables, and the partition that held
+        # them must keep its compressed segments — the parity checks below
+        # read the survivors through the tombstone-aware compressed path.
+        assert plain_rows == []
+        assert deltax_rows == []
+        still_compressed = db.execute(
+            f"""
+            SELECT count(*)
+            FROM deltax.deltax_partition_info('{deltax_table}')
+            WHERE is_compressed
+              AND range_start <= '2024-05-02 12:00:00+00'
+              AND range_end > '2024-05-02 12:00:00+00'
+            """
+        ).fetchone()[0]
+        assert still_compressed == 1
+
+    deltax_total = db.execute(f"SELECT count(*) FROM {deltax_table}").fetchone()[0]
+    plain_total = db.execute(f"SELECT count(*) FROM {plain_table}").fetchone()[0]
+    assert deltax_total == plain_total
+
+    assert_query_case(
+        db,
+        _rtabench_case("dimension_join_fact_inner"),
+        plain_table=plain_table,
+        deltax_table=deltax_table,
+    )
 
 
 @pytest.mark.parametrize("case", [c for c in rtabench_synthetic_cases() if c.name in JOIN_STRATEGY_CASES], ids=lambda case: case.name)

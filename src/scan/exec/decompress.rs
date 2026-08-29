@@ -21,7 +21,7 @@ use super::segments::{
 };
 use super::text_col::{
     TextQualInfo, apply_text_eq_filter, apply_text_in_filter, apply_text_like_filter,
-    decompress_text_to_seg_col, strcoll_cmp,
+    decompress_text_to_seg_col,
 };
 use super::{CUSTOM_EXEC_METHODS, DELTAX_APPEND_EXEC_METHODS};
 
@@ -111,6 +111,11 @@ pub(crate) struct DecompressState {
     topn_done: bool,
     /// Whether the Top-N sort column is a text type (uses byte comparison).
     topn_sort_is_text: bool,
+    /// Collation OID for the Top-N text sort — the sort column's own
+    /// collation, resolved once in `exec_topn_text`. `DEFAULT_COLLATION_OID`
+    /// until resolved (and if it can't be resolved), preserving the historical
+    /// default-collation behavior.
+    topn_collation: pg_sys::Oid,
 
     /// DSM-resident shared state when running as a parallel partial scan.
     /// Null in the serial path; non-null after `InitializeDSMCustomScan`
@@ -138,6 +143,65 @@ pub(crate) struct DecompressState {
     /// `ShutdownCustomScan` before the DSM is torn down. Empty on workers
     /// and in the serial path. Consumed by `ExplainCustomScan`.
     pub(crate) cached_worker_timings: Vec<ScanTimingShmem>,
+
+    /// P1 heap tail (Phase 3): loose rows INSERTed into compressed
+    /// partitions live in the partition heap and are emitted after the last
+    /// segment. `None` when every involved partition heap is empty (the
+    /// common case — zero overhead). Workers never set this; in parallel
+    /// DeltaXAppend only the leader emits the heap tail.
+    heap_tail: Option<HeapTailScan>,
+}
+
+/// State for the Phase 3 heap-tail scan: iterates the live tuples of one or
+/// more partition heaps under the query snapshot.
+struct HeapTailScan {
+    /// Partition heap OIDs left to scan (DeltaXDecompress: one; DeltaXAppend:
+    /// every compressed child whose heap had blocks at begin time).
+    oids: Vec<pg_sys::Oid>,
+    /// Index of the relation currently being scanned (or next to open).
+    idx: usize,
+    /// Currently open relation (null when between relations).
+    rel: pg_sys::Relation,
+    /// Active heap scan on `rel` (null when between relations).
+    scan: pg_sys::TableScanDesc,
+    /// Query snapshot captured at BeginCustomScan.
+    snapshot: pg_sys::Snapshot,
+}
+
+impl HeapTailScan {
+    fn new(oids: Vec<pg_sys::Oid>, snapshot: pg_sys::Snapshot) -> Self {
+        HeapTailScan {
+            oids,
+            idx: 0,
+            rel: std::ptr::null_mut(),
+            scan: std::ptr::null_mut(),
+            snapshot,
+        }
+    }
+
+    /// Close the currently open scan + relation, if any.
+    unsafe fn close_current(&mut self) {
+        unsafe {
+            if !self.scan.is_null() {
+                if let Some(end) = (*(*self.rel).rd_tableam).scan_end {
+                    end(self.scan);
+                }
+                self.scan = std::ptr::null_mut();
+            }
+            if !self.rel.is_null() {
+                pg_sys::table_close(self.rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                self.rel = std::ptr::null_mut();
+            }
+        }
+    }
+
+    /// Reset for rescan: close anything open and start over.
+    unsafe fn reset(&mut self) {
+        unsafe {
+            self.close_current();
+        }
+        self.idx = 0;
+    }
 }
 
 /// Wall-clock timing for the decompress scan phases.
@@ -201,6 +265,9 @@ pub(crate) struct ScanTiming {
     pub(crate) blob_cache_misses: u64,
     /// Bytes served from the blob cache (sum across hits).
     pub(crate) blob_cache_bytes_served: u64,
+    /// Rows emitted from the Phase 3 heap tail (loose rows inserted into
+    /// compressed partitions after compression).
+    pub(crate) heap_tail_rows: u64,
 }
 
 /// POD projection of `ScanTiming` for cross-process DSM aggregation.
@@ -356,7 +423,8 @@ fn segment_pre_pruned_by_metadata(
         if time_min.is_some_and(|qmin| seg_max < qmin) {
             return true;
         }
-        if time_max.is_some_and(|qmax| seg_min > qmax) {
+        // time_max is exclusive (canonical half-open bounds).
+        if time_max.is_some_and(|qmax| seg_min >= qmax) {
             return true;
         }
     }
@@ -374,6 +442,11 @@ struct ParsedCustomPrivate {
     header: Vec<i32>,
     needed_indices: Vec<usize>,
     topn: Option<TopNRaw>,
+    /// `[-4, flag]` trailer: true when the planner claimed sorted output
+    /// (pathkeys) for this scan. The executor errors if the flag is set but
+    /// the partition heap has gained loose rows since planning (stale
+    /// cached plan) — appended heap-tail rows would break the sort promise.
+    pathkeys_claimed: bool,
 }
 
 struct TopNRaw {
@@ -391,11 +464,13 @@ unsafe fn parse_custom_private(list: *mut pg_sys::List) -> ParsedCustomPrivate {
     let mut header = Vec::new();
     let mut needed_indices = Vec::new();
     let mut topn: Option<TopNRaw> = None;
+    let mut pathkeys_claimed = false;
     if list.is_null() {
         return ParsedCustomPrivate {
             header,
             needed_indices,
             topn,
+            pathkeys_claimed,
         };
     }
     let len = unsafe { (*list).length };
@@ -406,6 +481,14 @@ unsafe fn parse_custom_private(list: *mut pg_sys::List) -> ParsedCustomPrivate {
         if val == -1 && sec == 0 {
             sec = 1;
             i += 1;
+            continue;
+        }
+        if val == -4 && sec >= 1 {
+            // Two-int pathkeys-claimed marker; section state is unchanged.
+            if i + 1 < len {
+                pathkeys_claimed = unsafe { pg_sys::list_nth_int(list, i + 1) } != 0;
+            }
+            i += 2;
             continue;
         }
         if val == -2 && sec == 1 {
@@ -443,6 +526,7 @@ unsafe fn parse_custom_private(list: *mut pg_sys::List) -> ParsedCustomPrivate {
         header,
         needed_indices,
         topn,
+        pathkeys_claimed,
     }
 }
 
@@ -523,7 +607,7 @@ pub(crate) unsafe extern "C-unwind" fn create_custom_scan_state(
 #[pg_guard]
 pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
     node: *mut pg_sys::CustomScanState,
-    _estate: *mut pg_sys::EState,
+    estate: *mut pg_sys::EState,
     _eflags: i32,
 ) {
     unsafe {
@@ -540,7 +624,7 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
         let companion_oid = pg_sys::Oid::from(parsed.header[0] as u32);
         let needed_indices = parsed.needed_indices;
         let (
-            topn_limit,
+            mut topn_limit,
             topn_ascending,
             topn_nulls_first,
             topn_multi_col_sort,
@@ -556,14 +640,62 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
             None => (0i64, true, false, false, 0i32),
         };
 
+        // P1 heap tail (Phase 3): the scan relation (the partition heap,
+        // opened by PG core since scanrelid > 0) may hold loose rows
+        // inserted after compression. Detect that here; exec then unions
+        // the heap tail after the segments.
+        let scan_rel = (*node).ss.ss_currentRelation;
+        let heap_tail_oids: Vec<pg_sys::Oid> = if !scan_rel.is_null()
+            && pg_sys::RelationGetNumberOfBlocksInFork(scan_rel, pg_sys::ForkNumber::MAIN_FORKNUM)
+                > 0
+        {
+            if parsed.pathkeys_claimed {
+                pgrx::error!(
+                    "pg_deltax: compressed partition \"{}\" gained uncompressed rows after this plan was created (sorted scan); retry the query",
+                    relation_name(scan_rel),
+                );
+            }
+            // Heap-tail rows disable Top-N pushdown — the pruned candidate
+            // set would not include loose rows. The plan-time gate already
+            // does this for fresh plans; this covers stale cached plans.
+            topn_limit = 0;
+            vec![(*scan_rel).rd_id]
+        } else {
+            Vec::new()
+        };
+
         // Load metadata (cached), then load segment data via direct heap scan
         // (plan_qual is passed so batch qual columns are included in needed_cols)
         let plan_qual = (*(*node).ss.ps.plan).qual;
         let mut state =
             load_decompress_state(companion_oid, &needed_indices, plan_qual, topn_limit);
 
-        // If all plan quals are handled by batch eval, skip PG's per-row ExecQual
-        if state.all_quals_batch_handled {
+        if !heap_tail_oids.is_empty() {
+            // Schema guard: heap tuples are deformed positionally into the
+            // scan slot, so the partition heap and the scan output slot must
+            // share a physical layout. Compared against the scan slot's
+            // natts, NOT the compressed column count — the latter includes
+            // json_extract synthetic columns (absent from the heap and from
+            // a scan that doesn't select them). The emit path re-checks per
+            // partition; this is the early, single-partition catch.
+            let rel_natts = (*(*scan_rel).rd_att).natts as usize;
+            let slot_natts = (*(*(*node).ss.ss_ScanTupleSlot).tts_tupleDescriptor).natts as usize;
+            if rel_natts != slot_natts {
+                pgrx::error!(
+                    "pg_deltax: compressed partition \"{}\" has uncompressed rows whose physical layout ({} attrs) does not match the scan output ({} attrs); this can happen when a query selects a json_extract column from a partition with loose rows — run deltax_compact_partition() or decompress + recompress it",
+                    relation_name(scan_rel),
+                    rel_natts,
+                    slot_natts,
+                );
+            }
+            state.heap_tail = Some(HeapTailScan::new(heap_tail_oids, (*estate).es_snapshot));
+        }
+
+        // If all plan quals are handled by batch eval, skip PG's per-row
+        // ExecQual — except when a heap tail exists: heap-tail rows are not
+        // batch-filtered, so the full qual must run per row (segment rows
+        // get double-filtered, which is correct, just slightly slower).
+        if state.all_quals_batch_handled && state.heap_tail.is_none() {
             (*node).ss.ps.qual = std::ptr::null_mut();
         }
 
@@ -672,11 +804,13 @@ fn make_worker_stub_state() -> DecompressState {
         topn_cursor: 0,
         topn_done: false,
         topn_sort_is_text: false,
+        topn_collation: pg_sys::DEFAULT_COLLATION_OID,
         pscan: std::ptr::null_mut(),
         wire_base: std::ptr::null(),
         wire_view: None,
         is_worker_stub: true,
         cached_worker_timings: Vec::new(),
+        heap_tail: None,
     }
 }
 
@@ -684,10 +818,19 @@ fn make_worker_stub_state() -> DecompressState {
 #[pg_guard]
 pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
     node: *mut pg_sys::CustomScanState,
-    _estate: *mut pg_sys::EState,
-    _eflags: i32,
+    estate: *mut pg_sys::EState,
+    eflags: i32,
 ) {
     unsafe {
+        // Plain EXPLAIN never calls ExecCustomScan; skip the metadata SPI +
+        // segment heap scan and leave a stub state (same shape the parallel
+        // worker path uses) for EndCustomScan to tear down.
+        if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32 != 0 {
+            let stub = Box::new(make_worker_stub_state());
+            (*node).custom_ps = Box::into_raw(stub) as *mut pg_sys::List;
+            return;
+        }
+
         // Parallel-worker short-circuit (§5.7). The worker's `begin` is called
         // before DSM is attached, so we cannot read metadata here. Install a
         // stub `DecompressState` and defer full hydration to
@@ -711,7 +854,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             .collect();
         let needed_indices = parsed.needed_indices;
         let (
-            topn_limit,
+            mut topn_limit,
             topn_ascending,
             topn_nulls_first,
             topn_multi_col_sort,
@@ -731,6 +874,55 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             pgrx::error!("pg_deltax: DeltaXAppend has no companion tables");
         }
 
+        // P1 heap tail (Phase 3): collect the compressed children whose
+        // partition heap holds loose rows (transparent INSERTs after
+        // compression). Their live tuples are emitted by the leader after
+        // the segment cursor is exhausted.
+        // Consult the `has_loose_rows` catalog flag (via the backend flag
+        // map) instead of physically probing each partition heap: a
+        // segment-only scan otherwise never opens the partition heaps, and
+        // opening all of them just to check emptiness is the dominant
+        // fresh-backend cost on wide point queries. The flag is MVCC-exact
+        // and invalidation-backed (see `hook::DML_FLAGS`); only partitions
+        // the flag marks as holding loose rows get opened and scanned.
+        let heap_tail_oids: Vec<pg_sys::Oid> = {
+            let mut v = Vec::new();
+            for &oid in &companion_oids {
+                // Flag lookup by companion OID first (one hash probe, no
+                // catalog round-trip). Only when loose rows actually exist
+                // do we resolve the partition OID and scan its heap.
+                if !crate::scan::hook::companion_has_loose_rows_flag(oid) {
+                    continue;
+                }
+                let part_oid = super::segments::partition_oid_for_companion(oid);
+                if part_oid == pg_sys::InvalidOid {
+                    pgrx::error!(
+                        "pg_deltax: cannot resolve partition for companion OID {} (catalog inconsistency)",
+                        u32::from(oid)
+                    );
+                }
+                v.push(part_oid);
+            }
+            v
+        };
+        if !heap_tail_oids.is_empty() {
+            // Loose rows would be invisible to the Top-N candidate pass;
+            // fall back to the full scan (upper Sort/Limit stays correct —
+            // DeltaXAppend never claims pathkeys).
+            topn_limit = 0;
+            // The heap tail is emitted by the leader's plan copy only. With
+            // parallel_leader_participation=off and workers launched, Gather
+            // never drives the leader's copy, so the tail would be silently
+            // dropped. Error instead — never wrong results.
+            if (*(*node).ss.ps.plan).parallel_aware && !pg_sys::parallel_leader_participation {
+                pgrx::error!(
+                    "pg_deltax: a compressed partition holds uncompressed rows, which a parallel \
+                     scan can only return with parallel_leader_participation=on; re-enable it or \
+                     run deltax_compact_partition() and retry"
+                );
+            }
+        }
+
         // Load metadata for first companion table (cached per-backend).
         let t0 = Instant::now();
         let meta = super::segments::load_metadata_cached(companion_oids[0]);
@@ -746,8 +938,10 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             (*plan_qual).length as usize
         };
         let all_quals_batch_handled = handled_count > 0 && handled_count == nquals;
-        if all_quals_batch_handled {
-            // All quals are handled by batch eval — skip PG's per-row ExecQual
+        if all_quals_batch_handled && heap_tail_oids.is_empty() {
+            // All quals are handled by batch eval — skip PG's per-row
+            // ExecQual. With a heap tail the full qual must keep running:
+            // heap-tail rows are never batch-filtered.
             (*node).ss.ps.qual = std::ptr::null_mut();
         }
 
@@ -935,11 +1129,13 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             topn_cursor: 0,
             topn_done: false,
             topn_sort_is_text,
+            topn_collation: pg_sys::DEFAULT_COLLATION_OID,
             pscan: std::ptr::null_mut(),
             wire_base: std::ptr::null(),
             wire_view: None,
             is_worker_stub: false,
             cached_worker_timings: Vec::new(),
+            heap_tail: None,
         };
 
         // Create per-segment memory context
@@ -956,6 +1152,10 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         state
             .segments_data
             .sort_by_key(|s| s.min_time.unwrap_or(i64::MAX));
+
+        if !heap_tail_oids.is_empty() {
+            state.heap_tail = Some(HeapTailScan::new(heap_tail_oids, (*estate).es_snapshot));
+        }
 
         let state_box = Box::new(state);
         let state_ptr = Box::into_raw(state_box);
@@ -1130,11 +1330,13 @@ fn load_decompress_state(
         topn_cursor: 0,
         topn_done: false,
         topn_sort_is_text: false,
+        topn_collation: pg_sys::DEFAULT_COLLATION_OID,
         pscan: std::ptr::null_mut(),
         wire_base: std::ptr::null(),
         wire_view: None,
         is_worker_stub: false,
         cached_worker_timings: Vec::new(),
+        heap_tail: None,
     }
 }
 
@@ -1149,9 +1351,31 @@ struct TextTopNCandidate {
     phase1_datums: Vec<(usize, pg_sys::Datum, bool)>,
 }
 
-/// Compare two text datums using PG's collation-aware comparison.
+/// Compare two UTF-8 byte strings under `coll_oid` using PG's collation-aware
+/// comparator. `varstr_cmp` dispatches to memcmp (C/POSIX), libc `strcoll`, or
+/// ICU as the collation requires, so passing the sort column's own collation
+/// is what makes non-default collations (e.g. ICU) sort correctly.
 #[inline]
-unsafe fn cmp_text_datums(a: pg_sys::Datum, b: pg_sys::Datum) -> std::cmp::Ordering {
+unsafe fn varstr_cmp_bytes(a: &[u8], b: &[u8], coll_oid: pg_sys::Oid) -> std::cmp::Ordering {
+    unsafe {
+        pg_sys::varstr_cmp(
+            a.as_ptr() as *const std::ffi::c_char,
+            a.len() as i32,
+            b.as_ptr() as *const std::ffi::c_char,
+            b.len() as i32,
+            coll_oid,
+        )
+        .cmp(&0)
+    }
+}
+
+/// Compare two text datums under `coll_oid`.
+#[inline]
+unsafe fn cmp_text_datums(
+    a: pg_sys::Datum,
+    b: pg_sys::Datum,
+    coll_oid: pg_sys::Oid,
+) -> std::cmp::Ordering {
     unsafe {
         let a_vl = a.cast_mut_ptr::<pg_sys::varlena>();
         let b_vl = b.cast_mut_ptr::<pg_sys::varlena>();
@@ -1159,7 +1383,7 @@ unsafe fn cmp_text_datums(a: pg_sys::Datum, b: pg_sys::Datum) -> std::cmp::Order
         let a_len = pgrx::varsize_any_exhdr(a_vl) as i32;
         let b_ptr = pgrx::vardata_any(b_vl) as *const std::ffi::c_char;
         let b_len = pgrx::varsize_any_exhdr(b_vl) as i32;
-        let result = pg_sys::varstr_cmp(a_ptr, a_len, b_ptr, b_len, pg_sys::DEFAULT_COLLATION_OID);
+        let result = pg_sys::varstr_cmp(a_ptr, a_len, b_ptr, b_len, coll_oid);
         result.cmp(&0)
     }
 }
@@ -1171,6 +1395,7 @@ unsafe fn cmp_text_key(
     b_is_null: bool,
     ascending: bool,
     nulls_first: bool,
+    coll_oid: pg_sys::Oid,
 ) -> std::cmp::Ordering {
     unsafe {
         match (a_is_null, b_is_null) {
@@ -1191,9 +1416,9 @@ unsafe fn cmp_text_key(
             }
             (false, false) => {
                 if ascending {
-                    cmp_text_datums(a, b)
+                    cmp_text_datums(a, b, coll_oid)
                 } else {
-                    cmp_text_datums(b, a)
+                    cmp_text_datums(b, a, coll_oid)
                 }
             }
         }
@@ -1205,6 +1430,7 @@ unsafe fn cmp_text_candidate(
     b: &TextTopNCandidate,
     ascending: bool,
     nulls_first: bool,
+    coll_oid: pg_sys::Oid,
 ) -> std::cmp::Ordering {
     unsafe {
         cmp_text_key(
@@ -1214,8 +1440,120 @@ unsafe fn cmp_text_candidate(
             b.sort_is_null,
             ascending,
             nulls_first,
+            coll_oid,
         )
     }
+}
+
+/// True when sorting text under `coll_oid` is equivalent to byte-order
+/// comparison of the UTF-8 bytes: the C/POSIX locales (memcmp by definition)
+/// and codepoint-order locales (glibc `C.UTF-8`, builtin-provider `C.UTF-8`),
+/// where codepoint order equals byte order for valid UTF-8. When true, the
+/// Top-N text path can prune with exact per-worker limits and skip the
+/// strcoll merge sort entirely.
+unsafe fn collation_is_byte_order(coll_oid: pg_sys::Oid) -> bool {
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<HashMap<pg_sys::Oid, bool>> = RefCell::new(HashMap::new());
+    }
+
+    // The POSIX collation (oid 951) resolves through the generic
+    // pg_collation path below (provider 'c', collcollate "POSIX").
+    if coll_oid == pg_sys::C_COLLATION_OID {
+        return true;
+    }
+    if coll_oid == pg_sys::InvalidOid {
+        return false;
+    }
+    if let Some(cached) = CACHE.with(|c| c.borrow().get(&coll_oid).copied()) {
+        return cached;
+    }
+
+    unsafe fn syscache_text_attr(
+        cache_id: pg_sys::SysCacheIdentifier::Type,
+        tup: pg_sys::HeapTuple,
+        attnum: u32,
+    ) -> Option<String> {
+        unsafe {
+            let mut isnull = false;
+            let datum = pg_sys::SysCacheGetAttr(cache_id as i32, tup, attnum as i16, &mut isnull);
+            if isnull {
+                return None;
+            }
+            let detoasted = pg_sys::pg_detoast_datum(datum.cast_mut_ptr::<pg_sys::varlena>());
+            let bytes = std::slice::from_raw_parts(
+                pgrx::vardata_any(detoasted).cast::<u8>(),
+                pgrx::varsize_any_exhdr(detoasted),
+            );
+            let s = String::from_utf8_lossy(bytes).into_owned();
+            if detoasted != datum.cast_mut_ptr::<pg_sys::varlena>() {
+                pg_sys::pfree(detoasted as *mut _);
+            }
+            Some(s)
+        }
+    }
+
+    let result = unsafe {
+        let (provider, locale) = if coll_oid == pg_sys::DEFAULT_COLLATION_OID {
+            let cache_id = pg_sys::SysCacheIdentifier::DATABASEOID;
+            let tup = pg_sys::SearchSysCache1(
+                cache_id as i32,
+                pg_sys::ObjectIdGetDatum(pg_sys::MyDatabaseId),
+            );
+            if tup.is_null() {
+                return false;
+            }
+            let form = pg_sys::GETSTRUCT(tup) as pg_sys::Form_pg_database;
+            let provider = (*form).datlocprovider as u8 as char;
+            let attnum = if provider == 'c' {
+                pg_sys::Anum_pg_database_datcollate
+            } else {
+                pg_sys::Anum_pg_database_datlocale
+            };
+            let locale = syscache_text_attr(cache_id, tup, attnum);
+            pg_sys::ReleaseSysCache(tup);
+            (provider, locale)
+        } else {
+            let cache_id = pg_sys::SysCacheIdentifier::COLLOID;
+            let tup = pg_sys::SearchSysCache1(cache_id as i32, pg_sys::ObjectIdGetDatum(coll_oid));
+            if tup.is_null() {
+                return false;
+            }
+            let form = pg_sys::GETSTRUCT(tup) as pg_sys::Form_pg_collation;
+            let provider = (*form).collprovider as u8 as char;
+            let attnum = if provider == 'c' {
+                pg_sys::Anum_pg_collation_collcollate
+            } else {
+                pg_sys::Anum_pg_collation_colllocale
+            };
+            let locale = syscache_text_attr(cache_id, tup, attnum);
+            pg_sys::ReleaseSysCache(tup);
+            (provider, locale)
+        };
+
+        let locale = locale.as_deref().unwrap_or("");
+        match provider {
+            // libc: C/POSIX are memcmp; glibc C.UTF-8 collates by codepoint,
+            // which equals byte order for the UTF-8 server encoding.
+            'c' => {
+                locale == "C"
+                    || locale == "POSIX"
+                    || ((locale == "C.UTF-8" || locale == "C.utf8")
+                        && pg_sys::GetDatabaseEncoding() == pg_sys::pg_enc::PG_UTF8 as i32)
+            }
+            // builtin provider: C is memcmp; C.UTF-8 is codepoint order.
+            'b' => {
+                locale == "C"
+                    || (locale == "C.UTF-8"
+                        && pg_sys::GetDatabaseEncoding() == pg_sys::pg_enc::PG_UTF8 as i32)
+            }
+            // ICU (or unknown): never byte order.
+            _ => false,
+        }
+    };
+
+    CACHE.with(|c| c.borrow_mut().insert(coll_oid, result));
+    result
 }
 
 fn cmp_nullable_str_byte(
@@ -1250,11 +1588,12 @@ fn cmp_nullable_str_byte(
     }
 }
 
-fn cmp_nullable_str_collation(
+unsafe fn cmp_nullable_str_collation(
     a: Option<&str>,
     b: Option<&str>,
     ascending: bool,
     nulls_first: bool,
+    coll_oid: pg_sys::Oid,
 ) -> std::cmp::Ordering {
     match (a, b) {
         (None, None) => std::cmp::Ordering::Equal,
@@ -1272,13 +1611,13 @@ fn cmp_nullable_str_collation(
                 std::cmp::Ordering::Less
             }
         }
-        (Some(a), Some(b)) => {
+        (Some(a), Some(b)) => unsafe {
             if ascending {
-                strcoll_cmp(a, b)
+                varstr_cmp_bytes(a.as_bytes(), b.as_bytes(), coll_oid)
             } else {
-                strcoll_cmp(b, a)
+                varstr_cmp_bytes(b.as_bytes(), a.as_bytes(), coll_oid)
             }
-        }
+        },
     }
 }
 
@@ -1592,7 +1931,11 @@ unsafe fn exec_topn_two_pass(
             let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
             let mut blob_idx: usize = 0;
             let mut seg_val_idx: usize = 0;
-            let mut pre_selection: Vec<bool> = Vec::new();
+            // P2.5: tombstoned rows seed the selection (sized to the
+            // truncated row range when a Top-N cutoff applies).
+            let mut pre_selection: Vec<bool> = seg
+                .tombstone_preselection(cutoff_row.unwrap_or(seg.row_count as usize))
+                .unwrap_or_default();
             let mut sort_col_blob_idx: Option<usize> = None;
 
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
@@ -2193,14 +2536,15 @@ fn process_topn_text_chunk(
 
         // Decompress sort column
         let sort_blob = &seg.compressed_blobs[config.sort_blob_idx];
-        let sort_seg_col = match decompress_text_to_seg_col(sort_blob) {
+        let sort_seg_col = match decompress_text_to_seg_col(sort_blob, false) {
             Some(c) => c,
             None => continue,
         };
         let row_count = seg.row_count as usize;
 
-        // Decompress filter columns and build selection
-        let mut selection: Vec<bool> = Vec::new();
+        // Decompress filter columns and build selection. P2.5: tombstoned
+        // rows seed it (text filters AND into a non-empty selection).
+        let mut selection: Vec<bool> = seg.tombstone_preselection(row_count).unwrap_or_default();
 
         // Apply text quals via SegTextColumn
         for tqi in &config.text_qual_infos {
@@ -2243,7 +2587,7 @@ fn process_topn_text_chunk(
                     } else {
                         // Need to decompress this column — use a temporary
                         // Since we can't store the temp and reference it, decompress inline
-                        if let Some(ref sc) = decompress_text_to_seg_col(blob) {
+                        if let Some(ref sc) = decompress_text_to_seg_col(blob, false) {
                             apply_text_eq_filter(sc, const_str, *is_ne, row_count, &mut selection);
                         } else if selection.is_empty() {
                             selection = vec![false; row_count];
@@ -2269,7 +2613,7 @@ fn process_topn_text_chunk(
                         let blob_idx =
                             col_to_blob_idx(config.col_names, config.segment_by, *col_idx);
                         let blob = &seg.compressed_blobs[blob_idx];
-                        if let Some(ref sc) = decompress_text_to_seg_col(blob) {
+                        if let Some(ref sc) = decompress_text_to_seg_col(blob, false) {
                             apply_text_like_filter(
                                 sc,
                                 strategy,
@@ -2310,7 +2654,7 @@ fn process_topn_text_chunk(
                         let blob_idx =
                             col_to_blob_idx(config.col_names, config.segment_by, *col_idx);
                         let blob = &seg.compressed_blobs[blob_idx];
-                        if let Some(ref sc) = decompress_text_to_seg_col(blob) {
+                        if let Some(ref sc) = decompress_text_to_seg_col(blob, false) {
                             apply_text_in_filter(sc, values, row_count, &mut selection);
                         } else if selection.is_empty() {
                             selection = vec![false; row_count];
@@ -2433,7 +2777,7 @@ fn col_to_blob_idx(col_names: &[String], segment_by: &[String], target_col: usiz
 /// decompress + byte-order pruning in threads, then strcoll sort on merge.
 /// Falls back to sequential path otherwise.
 unsafe fn exec_topn_text(
-    _node: *mut pg_sys::CustomScanState,
+    node: *mut pg_sys::CustomScanState,
     state: &mut DecompressState,
     instrument: bool,
     plan_qual: *mut pg_sys::List,
@@ -2444,6 +2788,37 @@ unsafe fn exec_topn_text(
             None => return,
         };
         let effective_limit = state.topn_limit;
+
+        // Resolve the sort column's collation once. It drives two things: the
+        // byte-order fast path below (C/POSIX/C.UTF-8 → byte comparison is the
+        // final order, so per-worker pruning can use the exact limit and the
+        // merge skips strcoll), and, for every other collation, the OID handed
+        // to `varstr_cmp` so the merge sorts under the column's real collation
+        // (e.g. ICU) instead of the database default. The attname check guards
+        // against any attno/col_names misalignment (e.g. dropped columns).
+        let byte_order_collation = {
+            let rel = (*node).ss.ss_currentRelation;
+            if rel.is_null() {
+                false
+            } else {
+                let tupdesc = (*rel).rd_att;
+                if sort_col < (*tupdesc).natts as usize {
+                    let att = &*super::datum_utils::tupdesc_get_attr(tupdesc, sort_col);
+                    let att_name =
+                        std::ffi::CStr::from_ptr(att.attname.data.as_ptr()).to_string_lossy();
+                    if att_name == state.col_names[sort_col].as_str() {
+                        if att.attcollation != pg_sys::InvalidOid {
+                            state.topn_collation = att.attcollation;
+                        }
+                        collation_is_byte_order(att.attcollation)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+        };
 
         // Safety check: all plan quals must be batch-handled
         if !plan_qual.is_null() {
@@ -2539,7 +2914,26 @@ unsafe fn exec_topn_text(
 
         if use_parallel {
             // ===== Parallel path =====
-            let prune_limit = std::cmp::max(effective_limit * 100, 10000);
+            // Byte-order pruning in workers is exact under a byte-order
+            // collation; otherwise keep a wide margin because byte order and
+            // strcoll order can disagree. Multi-column sorts keep the margin
+            // too: rows tied on the first key must survive worker truncation
+            // so PG can order them by the remaining keys.
+            let prune_limit = if byte_order_collation && !state.topn_multi_col_sort {
+                effective_limit
+            } else {
+                std::cmp::max(effective_limit * 100, 10000)
+            };
+            let asc = state.topn_ascending;
+            let nf = state.topn_nulls_first;
+            let coll = state.topn_collation;
+            let cmp_merge = |a: Option<&str>, b: Option<&str>| {
+                if byte_order_collation {
+                    cmp_nullable_str_byte(a, b, asc, nf)
+                } else {
+                    cmp_nullable_str_collation(a, b, asc, nf, coll)
+                }
+            };
 
             // Build text qual infos for worker threads
             let mut text_qual_infos: Vec<TextQualInfo> = Vec::new();
@@ -2655,27 +3049,16 @@ unsafe fn exec_topn_text(
                 all_candidates.truncate(prune_limit);
             }
 
-            // Collation-aware final sort using strcoll_cmp
-            all_candidates.sort_by(|a, b| {
-                cmp_nullable_str_collation(
-                    a.2.as_deref(),
-                    b.2.as_deref(),
-                    state.topn_ascending,
-                    state.topn_nulls_first,
-                )
-            });
+            // Final sort: byte order when the collation allows it, strcoll otherwise
+            all_candidates.sort_by(|a, b| cmp_merge(a.2.as_deref(), b.2.as_deref()));
 
             // Truncate to effective_limit (handle multi_col_sort ties)
             if state.topn_multi_col_sort {
                 let threshold_idx = std::cmp::min(effective_limit - 1, all_candidates.len() - 1);
                 let threshold_str = all_candidates[threshold_idx].2.clone();
                 all_candidates.retain(|c| {
-                    cmp_nullable_str_collation(
-                        c.2.as_deref(),
-                        threshold_str.as_deref(),
-                        state.topn_ascending,
-                        state.topn_nulls_first,
-                    ) != std::cmp::Ordering::Greater
+                    cmp_merge(c.2.as_deref(), threshold_str.as_deref())
+                        != std::cmp::Ordering::Greater
                 });
             } else {
                 all_candidates.truncate(effective_limit);
@@ -2826,16 +3209,10 @@ unsafe fn exec_topn_text(
                 }
             }
 
-            // Sort result rows (collation-aware)
+            // Sort result rows (collation-aware unless byte order is exact)
             if !state.topn_multi_col_sort {
-                result_rows.sort_by(|a, b| {
-                    cmp_nullable_str_collation(
-                        a.sort_string.as_deref(),
-                        b.sort_string.as_deref(),
-                        state.topn_ascending,
-                        state.topn_nulls_first,
-                    )
-                });
+                result_rows
+                    .sort_by(|a, b| cmp_merge(a.sort_string.as_deref(), b.sort_string.as_deref()));
             }
 
             state.topn_buffer = result_rows.into_iter().map(|r| r.datums).collect();
@@ -2901,7 +3278,10 @@ unsafe fn exec_topn_text_sequential(
             let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
             let mut blob_idx: usize = 0;
             let mut seg_val_idx: usize = 0;
-            let mut pre_selection: Vec<bool> = Vec::new();
+            // P2.5: tombstoned rows seed the selection.
+            let mut pre_selection: Vec<bool> = seg
+                .tombstone_preselection(seg.row_count as usize)
+                .unwrap_or_default();
 
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
@@ -3081,6 +3461,7 @@ unsafe fn exec_topn_text_sequential(
                         threshold_is_null,
                         state.topn_ascending,
                         state.topn_nulls_first,
+                        state.topn_collation,
                     ) == std::cmp::Ordering::Greater
                 {
                     continue;
@@ -3128,7 +3509,13 @@ unsafe fn exec_topn_text_sequential(
             if candidates.len() >= effective_limit {
                 let n = effective_limit - 1;
                 candidates.select_nth_unstable_by(n, |a, b| {
-                    cmp_text_candidate(a, b, state.topn_ascending, state.topn_nulls_first)
+                    cmp_text_candidate(
+                        a,
+                        b,
+                        state.topn_ascending,
+                        state.topn_nulls_first,
+                        state.topn_collation,
+                    )
                 });
                 threshold_datum = Some((candidates[n].sort_datum, candidates[n].sort_is_null));
             }
@@ -3149,8 +3536,15 @@ unsafe fn exec_topn_text_sequential(
         }
 
         // Sort and truncate to top-N (using collation-aware comparison)
-        candidates
-            .sort_by(|a, b| cmp_text_candidate(a, b, state.topn_ascending, state.topn_nulls_first));
+        candidates.sort_by(|a, b| {
+            cmp_text_candidate(
+                a,
+                b,
+                state.topn_ascending,
+                state.topn_nulls_first,
+                state.topn_collation,
+            )
+        });
         if state.topn_multi_col_sort {
             let threshold_idx = std::cmp::min(effective_limit - 1, candidates.len() - 1);
             let threshold_datum_val = candidates[threshold_idx].sort_datum;
@@ -3163,6 +3557,7 @@ unsafe fn exec_topn_text_sequential(
                     threshold_is_null,
                     state.topn_ascending,
                     state.topn_nulls_first,
+                    state.topn_collation,
                 ) != std::cmp::Ordering::Greater
             });
         } else {
@@ -3339,6 +3734,7 @@ unsafe fn exec_topn_text_sequential(
                     b.sort_is_null,
                     state.topn_ascending,
                     state.topn_nulls_first,
+                    state.topn_collation,
                 )
             });
         }
@@ -3389,9 +3785,152 @@ pub(super) unsafe extern "C-unwind" fn exec_custom_scan(
                 return slot;
             }
             if !load_next_segment(state, instrument) {
+                // Phase 3: heap tail — live tuples sitting in the partition
+                // heap (loose rows inserted after compression). Emitted by
+                // the leader only, after every segment is consumed.
+                if let Some(slot) =
+                    try_emit_heap_tail_row(state, scan_slot, econtext, qual, proj_info)
+                {
+                    return slot;
+                }
                 pg_sys::ExecClearTuple(scan_slot);
                 return scan_slot;
             }
+        }
+    }
+}
+
+/// Phase 3: emit the next qualifying live tuple from the partition heap(s).
+///
+/// Active only when `state.heap_tail` was armed at begin time (some involved
+/// partition heap had blocks). Tuples are read with a plain heap scan under
+/// the query snapshot, deformed positionally into the scan slot (layout
+/// verified at begin), filtered through the full plan qual (`ExecQual` — heap
+/// rows never went through batch quals), and projected like segment rows.
+///
+/// Parallel DeltaXAppend: the heap tail is leader-only; workers return None
+/// immediately (their stub state has `heap_tail = None` anyway).
+///
+/// Returns `Some(slot)` for each qualifying row, `None` when every heap is
+/// exhausted (end of scan).
+unsafe fn try_emit_heap_tail_row(
+    state: &mut DecompressState,
+    scan_slot: *mut pg_sys::TupleTableSlot,
+    econtext: *mut pg_sys::ExprContext,
+    qual: *mut pg_sys::ExprState,
+    proj_info: *mut pg_sys::ProjectionInfo,
+) -> Option<*mut pg_sys::TupleTableSlot> {
+    unsafe {
+        // Belt-and-suspenders: never emit the heap tail from a worker.
+        if pg_sys::ParallelWorkerNumber >= 0 {
+            return None;
+        }
+        // Disjoint field borrows: the heap-tail cursor and the timing
+        // counters are updated independently inside the loop.
+        let ncols = state.col_names.len();
+        let timing = &mut state.timing;
+        let ht = state.heap_tail.as_mut()?;
+        loop {
+            if ht.scan.is_null() {
+                if ht.idx >= ht.oids.len() {
+                    return None;
+                }
+                let oid = ht.oids[ht.idx];
+                let rel = pg_sys::table_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                let rel_natts = (*(*rel).rd_att).natts as usize;
+                // The slot tupdesc is the partition's for DeltaXDecompress
+                // but the PARENT's for DeltaXAppend — plan Vars index it, so
+                // all three layouts must agree before deforming positionally
+                // (a dropped column on one side would silently misalign).
+                // The heap tuple is deformed positionally into the scan
+                // slot, so the partition heap and the scan slot must have
+                // the SAME physical layout. We do NOT compare against
+                // `ncols` (the compressed column count): it includes
+                // json-extract synthetic columns, which are absent from
+                // both the heap and this scan slot (the scan emits physical
+                // columns; synthetic values are computed by the upper plan
+                // from the physical payload column). A query that DOES need
+                // synthetic columns on heap-tail rows produces a wider scan
+                // slot (slot_natts > rel_natts) and is caught here.
+                let slot_natts = (*(*scan_slot).tts_tupleDescriptor).natts as usize;
+                let _ = ncols;
+                if slot_natts != rel_natts {
+                    let name = relation_name(rel);
+                    pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                    pgrx::error!(
+                        "pg_deltax: compressed partition \"{}\" has uncompressed rows whose physical layout ({} attrs) does not match the scan output ({} attrs); this can happen when a query selects a json_extract column from a partition with loose rows — run deltax_compact_partition() or decompress + recompress it",
+                        name,
+                        rel_natts,
+                        slot_natts,
+                    );
+                }
+                let flags: u32 = pg_sys::ScanOptions::SO_TYPE_SEQSCAN
+                    | pg_sys::ScanOptions::SO_ALLOW_STRAT
+                    | pg_sys::ScanOptions::SO_ALLOW_SYNC
+                    | pg_sys::ScanOptions::SO_ALLOW_PAGEMODE;
+                let scan = (*(*rel).rd_tableam).scan_begin.unwrap()(
+                    rel,
+                    ht.snapshot,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    flags,
+                );
+                ht.rel = rel;
+                ht.scan = scan;
+            }
+
+            let tuple = pg_sys::heap_getnext(ht.scan, pg_sys::ScanDirection::ForwardScanDirection);
+            if tuple.is_null() {
+                ht.close_current();
+                ht.idx += 1;
+                continue;
+            }
+
+            // Deform positionally into the scan slot (1:1 layout verified
+            // above). Pass-by-reference datums point into the scan's pinned
+            // page, which stays valid until the next heap_getnext — i.e.
+            // until the next call, matching the slot contract.
+            pg_sys::ExecClearTuple(scan_slot);
+            pg_sys::heap_deform_tuple(
+                tuple,
+                (*ht.rel).rd_att,
+                (*scan_slot).tts_values,
+                (*scan_slot).tts_isnull,
+            );
+            pg_sys::ExecStoreVirtualTuple(scan_slot);
+            (*econtext).ecxt_scantuple = scan_slot;
+
+            // Full plan qual — heap rows are never batch-filtered.
+            if !qual.is_null() && !exec_qual(qual, econtext) {
+                pg_sys::MemoryContextReset((*econtext).ecxt_per_tuple_memory);
+                timing.rows_filtered += 1;
+                continue;
+            }
+
+            let result = if !proj_info.is_null() {
+                exec_project(proj_info)
+            } else {
+                scan_slot
+            };
+            timing.rows_emitted += 1;
+            timing.heap_tail_rows += 1;
+            return Some(result);
+        }
+    }
+}
+
+/// Best-effort relation name for error messages.
+unsafe fn relation_name(rel: pg_sys::Relation) -> String {
+    unsafe {
+        if rel.is_null() {
+            return "?".to_string();
+        }
+        let p = pg_sys::get_rel_name((*rel).rd_id);
+        if p.is_null() {
+            format!("OID {}", u32::from((*rel).rd_id))
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
         }
     }
 }
@@ -3671,7 +4210,11 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
             let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
             let mut blob_idx = 0;
             let mut seg_val_idx = 0;
-            let mut pre_selection: Vec<bool> = Vec::new();
+            // P2.5: tombstoned (logically deleted) rows seed the selection
+            // vector — every downstream emit/aggregate path honors it.
+            let mut pre_selection: Vec<bool> = seg
+                .tombstone_preselection(seg.row_count as usize)
+                .unwrap_or_default();
             let has_batch_quals = !state.batch_quals.is_empty();
             let mut phase2_cols: Vec<(usize, usize)> = Vec::new(); // (col_idx, blob_idx)
 
@@ -3912,7 +4455,10 @@ pub(super) unsafe extern "C-unwind" fn end_custom_scan(node: *mut pg_sys::Custom
     unsafe {
         let state_ptr = (*node).custom_ps as *mut DecompressState;
         if !state_ptr.is_null() {
-            let state = Box::from_raw(state_ptr);
+            let mut state = Box::from_raw(state_ptr);
+            if let Some(ht) = state.heap_tail.as_mut() {
+                ht.close_current();
+            }
 
             // Emit timing summary at LOG level (visible with SET client_min_messages = log)
             // All timers are non-overlapping:
@@ -3952,6 +4498,9 @@ pub(super) unsafe extern "C-unwind" fn end_custom_scan(node: *mut pg_sys::Custom
                 t.topn_limit,
                 t.topn_candidates,
             );
+            if t.heap_tail_rows > 0 {
+                pgrx::log!("pg_deltax heap_tail: rows={}", t.heap_tail_rows);
+            }
 
             if !state.segment_mcxt.is_null() {
                 pg_sys::MemoryContextDelete(state.segment_mcxt);
@@ -3974,6 +4523,9 @@ pub(super) unsafe extern "C-unwind" fn rescan_custom_scan(node: *mut pg_sys::Cus
         state.topn_buffer.clear();
         state.topn_cursor = 0;
         state.topn_done = false;
+        if let Some(ht) = state.heap_tail.as_mut() {
+            ht.reset();
+        }
     }
 }
 
@@ -4173,7 +4725,29 @@ pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
                 col_sums: std::collections::HashMap::new(),
                 toast_pointers: vec![Vec::new(); num_blob_cols],
                 cached_blob_pins: Vec::new(),
+                tombstones: None,
             });
+        }
+        // P2.5: the DSM wire doesn't carry tombstones — each worker loads
+        // the (tiny) per-companion tombstone map itself under the shared
+        // parallel snapshot, so leader and workers see the same set. Cost is
+        // one syscache + nblocks probe per companion when none exist.
+        {
+            type TombMap = std::collections::HashMap<i32, std::sync::Arc<Vec<u32>>>;
+            let mut tomb_maps: std::collections::HashMap<pg_sys::Oid, Option<TombMap>> =
+                std::collections::HashMap::new();
+            for seg in segments_data.iter_mut() {
+                let map = tomb_maps.entry(seg.companion_oid).or_insert_with(|| {
+                    if super::segments::companion_may_have_tombstones(seg.companion_oid) {
+                        super::segments::load_tombstone_map(seg.companion_oid)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(m) = map {
+                    seg.tombstones = m.get(&seg.segment_id).cloned();
+                }
+            }
         }
         state.segments_data = segments_data;
         state.wire_view = Some(view);
@@ -4372,6 +4946,48 @@ mod tests {
     use super::*;
     use std::cmp::Ordering;
 
+    /// `collation_is_byte_order` is the correctness pivot of the Top-N text
+    /// byte-order fast path: a false positive makes Top-N return byte-sorted
+    /// (wrong) rows under a linguistic collation. Pin the classification for
+    /// the collations we can name deterministically across builds.
+    #[pgrx::pg_test]
+    fn test_collation_is_byte_order_classification() {
+        // C and POSIX are memcmp by definition — always byte-order.
+        // regcollation lowercases unquoted names, so the case-sensitive
+        // collation names must be double-quoted inside the literal.
+        let c_oid = pgrx::Spi::get_one::<pgrx::pg_sys::Oid>(r#"SELECT '"C"'::regcollation::oid"#)
+            .expect("spi C")
+            .expect("C collation exists");
+        let posix_oid =
+            pgrx::Spi::get_one::<pgrx::pg_sys::Oid>(r#"SELECT '"POSIX"'::regcollation::oid"#)
+                .expect("spi POSIX")
+                .expect("POSIX collation exists");
+        unsafe {
+            assert!(collation_is_byte_order(c_oid), "C must be byte-order");
+            assert!(
+                collation_is_byte_order(posix_oid),
+                "POSIX must be byte-order"
+            );
+            // No collation known → never byte-order (must fall back to strcoll).
+            assert!(!collation_is_byte_order(pgrx::pg_sys::InvalidOid));
+        }
+
+        // An ICU collation is linguistic and must NEVER be classified as
+        // byte-order. `unicode` (the ICU root collation) is predefined
+        // whenever the build has ICU; skip if this build lacks it.
+        if let Ok(Some(icu_oid)) = pgrx::Spi::get_one::<pgrx::pg_sys::Oid>(
+            "SELECT oid FROM pg_collation WHERE collname = 'unicode' \
+             AND collprovider = 'i' LIMIT 1",
+        ) {
+            unsafe {
+                assert!(
+                    !collation_is_byte_order(icu_oid),
+                    "ICU 'unicode' collation must not be treated as byte-order",
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_cmp_topn_key_ascending() {
         // ascending: smaller first
@@ -4563,6 +5179,7 @@ mod tests {
             col_sums: std::collections::HashMap::new(),
             toast_pointers: Vec::new(),
             cached_blob_pins: Vec::new(),
+            tombstones: None,
         };
         // No filters, no time range — never pruned.
         assert!(!segment_pre_pruned_by_metadata(&seg, &[], None, None));
@@ -4583,6 +5200,7 @@ mod tests {
             col_sums: std::collections::HashMap::new(),
             toast_pointers: Vec::new(),
             cached_blob_pins: Vec::new(),
+            tombstones: None,
         };
         // svi=0, filter "host-a" matches
         assert!(!segment_pre_pruned_by_metadata(
@@ -4629,6 +5247,7 @@ mod tests {
             col_sums: std::collections::HashMap::new(),
             toast_pointers: Vec::new(),
             cached_blob_pins: Vec::new(),
+            tombstones: None,
         };
         // Query range [3_000, ..) → seg.max_time (2_000) < 3_000, prune
         assert!(segment_pre_pruned_by_metadata(&seg, &[], Some(3_000), None));

@@ -40,7 +40,11 @@ pub(crate) fn kind_to_type_oid(kind: ColumnKind) -> pg_sys::Oid {
         ColumnKind::Timestamp => pg_sys::TIMESTAMPOID,
         ColumnKind::TimestampTz => pg_sys::TIMESTAMPTZOID,
         ColumnKind::Date => pg_sys::DATEOID,
+        ColumnKind::Time => pg_sys::TIMEOID,
         ColumnKind::Jsonb => pg_sys::JSONBOID,
+        ColumnKind::Uuid => pg_sys::UUIDOID,
+        ColumnKind::Bytea => pg_sys::BYTEAOID,
+        ColumnKind::Inet => pg_sys::INETOID,
     }
 }
 
@@ -84,7 +88,15 @@ impl AggChainCtx {
                 if rte.is_null() {
                     continue;
                 }
-                if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION || !(*rte).inh {
+                if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
+                    continue;
+                }
+                // Regular expanded parent, or one the flatten walker planned
+                // un-expanded (pg_deltax.flatten_partitions) — the chain
+                // rewrite treats both identically.
+                let flattened = super::hook::is_partitioned_relkind((*rte).relkind)
+                    && super::hook::is_flattened_parent((*rte).relid);
+                if !(*rte).inh && !flattened {
                     continue;
                 }
                 let parent_oid = (*rte).relid;
@@ -2107,8 +2119,22 @@ unsafe fn rebuild_cscan_custom_private(cscan: *mut pg_sys::CustomScan, reference
                 InSynth,
             }
             let mut phase = Phase::BeforeMinus1;
+            // `[-4, flag]` (pathkeys-claimed marker) is a two-int section
+            // that may appear after the cols or top-n sections; preserve it
+            // verbatim wherever it sits.
+            let mut copy_next = false;
             for i in 0..(*cp).length {
                 let v = pg_sys::list_nth_int(cp, i);
+                if copy_next {
+                    new_cp = pg_sys::lappend_int(new_cp, v);
+                    copy_next = false;
+                    continue;
+                }
+                if v == -4 && phase != Phase::BeforeMinus1 {
+                    new_cp = pg_sys::lappend_int(new_cp, v);
+                    copy_next = true;
+                    continue;
+                }
                 match phase {
                     Phase::BeforeMinus1 => {
                         new_cp = pg_sys::lappend_int(new_cp, v);

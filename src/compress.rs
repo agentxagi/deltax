@@ -436,44 +436,6 @@ fn deltax_enable_compression(
                 )
             });
 
-        // Warn now about columns that will make compression refuse later. Doing
-        // it here means the operator finds out while configuring the table, not
-        // a month later when the first partition closes.
-        {
-            let types = client
-                .select(
-                    "SELECT column_name::text, data_type::text
-                       FROM information_schema.columns
-                      WHERE table_schema = $1 AND table_name = $2
-                      ORDER BY ordinal_position",
-                    None,
-                    &[schema.as_str().into(), table.as_str().into()],
-                )
-                .expect("failed to read column types");
-            for row in types {
-                let name = row
-                    .get_datum_by_ordinal(1)
-                    .ok()
-                    .and_then(|d| d.value::<String>().ok().flatten());
-                let dt = row
-                    .get_datum_by_ordinal(2)
-                    .ok()
-                    .and_then(|d| d.value::<String>().ok().flatten());
-                if let (Some(name), Some(dt)) = (name, dt)
-                    && let Err(reason) = check_compressible_type(&dt)
-                {
-                    pgrx::warning!(
-                        "pg_deltax: {}.{} column \"{}\" — {}. Compressing a partition of this \
-                         table will be refused until the column is removed.",
-                        schema,
-                        table,
-                        name,
-                        reason
-                    );
-                }
-            }
-        }
-
         // Validate segment_by columns exist
         for col in &segment_by {
             let exists = client
@@ -623,7 +585,51 @@ fn deltax_set_compression_policy(relation: &str, compress_after: pgrx::datum::In
 /// Compress a single partition.
 #[pg_extern]
 fn deltax_compress_partition(partition: &str) -> String {
-    Spi::connect_mut(|client| compress_partition_impl(client, partition))
+    Spi::connect_mut(|client| {
+        let msg = compress_partition_impl(client, partition);
+        // Refresh the parent-relation merged statistics so a manual
+        // compress leaves the planner-visible stats current (with
+        // pg_deltax.flatten_partitions the planner reads ONLY the parent's
+        // pg_statistic rows — children aren't expanded). Deliberately in
+        // the wrapper, NOT in compress_partition_impl: the maintenance
+        // pass compresses many partitions in one transaction while holding
+        // their AccessExclusive locks, and refreshing the parent's catalog
+        // rows between partition lock acquisitions adds lock edges (and a
+        // wide interleave window) against concurrent DDL like DROP TABLE
+        // CASCADE — a real deadlock seen in CI. The pass refreshes once
+        // per table after auto-compress instead (worker.rs).
+        if msg.starts_with("Compressed") {
+            refresh_parent_stats_for_partition(client, partition);
+        }
+        msg
+    })
+}
+
+/// Best-effort parent-stats refresh for the deltatable owning `partition`.
+/// Failures warn rather than error — the partition is compressed and
+/// queryable either way, just with staler planner estimates.
+fn refresh_parent_stats_for_partition(client: &mut SpiClient, partition: &str) {
+    let (schema, part_table) = crate::partition::resolve_relation(client, partition);
+    let ht = catalog::get_partition_by_name(client, &schema, &part_table)
+        .ok()
+        .flatten()
+        .and_then(|p| {
+            catalog::get_deltatable_by_id(client, p.deltatable_id)
+                .ok()
+                .flatten()
+        });
+    let Some(ht) = ht else { return };
+    if let Err(e) = crate::stats::write_table_stats(client, &ht.schema_name, &ht.table_name) {
+        pgrx::warning!(
+            "pg_deltax: failed to refresh parent stats for {}.{}: {}. \
+             Run deltax_analyze_table('{}.{}') to retry.",
+            ht.schema_name,
+            ht.table_name,
+            e,
+            ht.schema_name,
+            ht.table_name,
+        );
+    }
 }
 
 /// Compress every "sealed" uncompressed partition of a deltax-managed table
@@ -696,6 +702,7 @@ fn deltax_compress_all_partitions(
         }
 
         let mut out: Vec<(String, String)> = Vec::with_capacity(targets.len());
+        let mut any_compressed = false;
         for (sch, name) in targets {
             // `compress_partition_impl` re-resolves the name via
             // `resolve_relation`, which expects an unquoted `schema.table`
@@ -703,7 +710,21 @@ fn deltax_compress_all_partitions(
             // simple identifiers, so this is safe.
             let qualified = format!("{}.{}", sch, name);
             let msg = compress_partition_impl(client, &qualified);
+            any_compressed |= msg.starts_with("Compressed");
             out.push((name, msg));
+        }
+        // One parent-stats refresh for the whole batch — see the
+        // deltax_compress_partition wrapper for why this must not run
+        // per-partition inside compress_partition_impl.
+        if any_compressed
+            && let Err(e) = crate::stats::write_table_stats(client, &ht.schema_name, &ht.table_name)
+        {
+            pgrx::warning!(
+                "pg_deltax: failed to refresh parent stats for {}.{}: {}",
+                ht.schema_name,
+                ht.table_name,
+                e,
+            );
         }
         out
     });
@@ -866,7 +887,72 @@ fn deltax_table_size(relation: &str) -> i64 {
 // Internal implementation
 // ============================================================================
 
+/// Scoped pin of the GUCs that affect the `::text` renderings compression
+/// stores for fallback-typed columns (`classify_column` → `ColumnKind::Text`
+/// with a non-text attribute type: interval, date/timestamp inside arrays or
+/// composites, float arrays, ...). The stored text must parse back to the
+/// same value under ANY reader session GUCs, so rendering pins:
+///
+/// - `IntervalStyle = postgres`: unit-labeled output that `interval_in`
+///   parses identically under every IntervalStyle (sql_standard renderings
+///   like '1-2' are re-interpreted differently per style — the pg_dump
+///   caveat, which pins the same value);
+/// - `DateStyle = ISO, MDY`: ISO date/timestamp text is unambiguous under
+///   every DateStyle (a 'DMY'-rendered '02/03/2025' inside e.g. a
+///   timestamptz[] would silently swap day/month for an 'MDY' reader);
+/// - `extra_float_digits = 1`: shortest-precise float rendering; a session
+///   with a negative setting would render floats inside arrays/composites
+///   lossily — permanent data loss, not just a read-side issue.
+///
+/// Uses the standard PG nest-level save/restore idiom (`NewGUCNestLevel` +
+/// `GUC_ACTION_SAVE` + `AtEOXact_GUC`), so the previous values come back at
+/// scope exit instead of leaking a `SET LOCAL` into the caller's transaction.
+/// On error, the transaction abort path restores them.
+struct RenderGucGuard {
+    nest_level: std::ffi::c_int,
+}
+
+impl RenderGucGuard {
+    fn pin() -> Self {
+        let nest_level = unsafe { pgrx::pg_sys::NewGUCNestLevel() };
+        for (name, value) in [
+            ("intervalstyle", "postgres"),
+            ("datestyle", "ISO, MDY"),
+            ("extra_float_digits", "1"),
+        ] {
+            let name_c = std::ffi::CString::new(name).unwrap();
+            let value_c = std::ffi::CString::new(value).unwrap();
+            unsafe {
+                pgrx::pg_sys::set_config_option(
+                    name_c.as_ptr(),
+                    value_c.as_ptr(),
+                    pgrx::pg_sys::GucContext::PGC_USERSET,
+                    pgrx::pg_sys::GucSource::PGC_S_SESSION,
+                    pgrx::pg_sys::GucAction::GUC_ACTION_SAVE,
+                    true,
+                    pgrx::pg_sys::PGERROR as std::ffi::c_int,
+                    false,
+                );
+            }
+        }
+        Self { nest_level }
+    }
+}
+
+impl Drop for RenderGucGuard {
+    fn drop(&mut self) {
+        // On panic/error the transaction abort path runs AtEOXact_GUC itself;
+        // calling it here with isCommit=true would be wrong mid-abort.
+        if !std::thread::panicking() {
+            unsafe { pgrx::pg_sys::AtEOXact_GUC(true, self.nest_level) };
+        }
+    }
+}
+
 fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
+    // Pin rendering GUCs for the whole pass: covers the streaming `::text`
+    // SELECT and the segment-by stats/valcounts queries.
+    let _render_gucs = RenderGucGuard::pin();
     // 1. Look up partition in catalog
     let (schema, part_table) = crate::partition::resolve_relation(client, partition);
     let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
@@ -883,16 +969,11 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         return format!("Partition {}.{} is already compressed", schema, part_table);
     }
 
-    // A partition still inside its time range keeps receiving rows, and a
-    // compressed partition is read-only — sealing it turns inserts into errors.
-    // Opt in per session when that is genuinely what you want.
+    // Open month partition must stay heap — compressed partitions are read-only.
     let range_end_usec = part_info.range_end.into_inner() + PG_EPOCH_OFFSET_USEC;
-    if range_end_usec > crate::partition::now_usec() && !crate::ALLOW_COMPRESS_OPEN_PARTITION.get()
-    {
+    if range_end_usec > crate::partition::now_usec() {
         pgrx::error!(
-            "pg_deltax: refusing to compress open partition {}.{} (range_end {} > now()); \
-             inserts into a compressed partition fail. Set \
-             pg_deltax.allow_compress_open_partition = on to override.",
+            "pg_deltax: refusing to compress open partition {}.{} (range_end {} > now())",
             schema,
             part_table,
             part_info.range_end
@@ -924,7 +1005,6 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     if columns.is_empty() {
         pgrx::error!("pg_deltax: no columns found for {}.{}", schema, part_table);
     }
-    assert_columns_compressible(&schema, &part_table, &columns);
 
     // 4. Estimate row count from pg_class stats (instant, no scan).
     // Used for skipping empty partitions.
@@ -1044,6 +1124,14 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     .expect("failed to update catalog");
     catalog::install_compressed_dml_trigger(client, &schema, &part_table)
         .expect("failed to install compressed partition DML trigger");
+
+    // P2.5: eagerly create the (empty) `_tombstones` companion so the
+    // OWNER/GRANT cascade covers it and tombstone DELETEs by non-owner
+    // roles don't need CREATE on the companion schema. Zero blocks ⇒ zero
+    // cost on every read path.
+    client
+        .update(&ddl_if_not_exists(&ddl.tombstones_ddl), None, &[])
+        .expect("failed to create tombstones table");
 
     // Persist per-column ndistinct from the partition-level HLL merge
     // (strictly more accurate than the old MAX-over-segments approach,
@@ -1205,7 +1293,11 @@ pub(crate) enum ColumnKind {
     Timestamp,   // timestamp without time zone — read as pgrx::Timestamp → i64 usec
     TimestampTz, // timestamp with time zone — read as pgrx::TimestampWithTimeZone → i64 usec
     Date,        // date — read as pgrx::Date → i64 usec
+    Time,        // time without time zone — read as pgrx::Time → i64 usec since midnight
     Jsonb,       // jsonb — stored as the binary varlena form produced by jsonb_in
+    Uuid,        // uuid — stored as the raw 16 bytes (fixed-length, by-reference)
+    Bytea,       // bytea — stored as the raw varlena payload bytes
+    Inet,        // inet/cidr — stored as the raw varlena payload (inet_struct bytes)
 }
 
 /// Column data stored in native types.
@@ -1274,77 +1366,6 @@ impl TypedColumn {
     }
 }
 
-/// Types stored as their `::text` form and rebuilt with the type's input
-/// function on read (see `str_to_text_datum`).
-///
-/// This is an allowlist and not a fallback on purpose. The round trip is exact
-/// only for types whose text output does not depend on a session setting:
-/// `money` moves with `lc_monetary` and `interval` with `IntervalStyle`, so a
-/// partition written under one setting would read back different under another.
-/// Anything absent from this list is refused at compression time rather than
-/// stored as text and guessed at on the way out — which is how a `numeric`
-/// ledger came back with tens of thousands of digits per row in July 2026.
-const TEXT_IO_COMPRESSIBLE: &[&str] = &[
-    "numeric", "decimal", "uuid", "inet", "cidr", "macaddr", "macaddr8", "bytea", "name", "citext",
-];
-
-/// Types whose text form *is* their varlena body — no input function needed.
-const NATIVE_TEXT_TYPES: &[&str] = &[
-    "text",
-    "character varying",
-    "varchar",
-    "character",
-    "char",
-    "bpchar",
-];
-
-/// Whether the compressor can store `data_type` and read it back unchanged.
-///
-/// `Err` carries the reason, ready to be shown to whoever ran the compression.
-pub(crate) fn check_compressible_type(data_type: &str) -> Result<(), String> {
-    let dt = data_type.trim().to_lowercase();
-    // Every kind other than Text has a dedicated codec and a typed read path.
-    if !matches!(classify_column(&dt, false), ColumnKind::Text) {
-        return Ok(());
-    }
-    // Strip a typmod ("numeric(18,8)") — information_schema doesn't emit one,
-    // but format_type and json_extract specs do.
-    let base = dt.split('(').next().unwrap_or(&dt).trim();
-    if NATIVE_TEXT_TYPES.contains(&base) || TEXT_IO_COMPRESSIBLE.contains(&base) {
-        return Ok(());
-    }
-    Err(format!(
-        "type {} is not supported by pg_deltax compression (supported: integer types, real, \
-         double precision, boolean, date, timestamp, timestamptz, text, varchar, char, jsonb, \
-         numeric, uuid, inet, cidr, macaddr, bytea)",
-        data_type
-    ))
-}
-
-/// Refuse to compress a partition holding a column we cannot reconstruct.
-///
-/// Runs before any blob is written. Reporting every offending column in one
-/// error saves a round of trial and error on wide tables.
-fn assert_columns_compressible(schema: &str, table: &str, columns: &[ColumnMeta]) {
-    let offenders: Vec<String> = columns
-        .iter()
-        .filter_map(|c| {
-            check_compressible_type(&c.data_type)
-                .err()
-                .map(|reason| format!("column \"{}\": {}", c.name, reason))
-        })
-        .collect();
-    if !offenders.is_empty() {
-        pgrx::error!(
-            "pg_deltax: cannot compress {}.{} — {}. Leave the partition uncompressed or drop the \
-             column from the table.",
-            schema,
-            table,
-            offenders.join("; ")
-        );
-    }
-}
-
 pub(crate) fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKind {
     if is_segment_by {
         return ColumnKind::Text; // segment_by always read as text for SQL literals
@@ -1370,6 +1391,19 @@ pub(crate) fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKin
         ColumnKind::Date
     } else if dt == "jsonb" {
         ColumnKind::Jsonb
+    } else if crate::FORCE_TEXT_FALLBACK.get() {
+        // TESTING: force the graduated types back onto the legacy ::text
+        // codecs so mixed-generation reads can be exercised with current code.
+        ColumnKind::Text
+    } else if dt == "time" || dt == "time without time zone" {
+        // timetz stays on the text fallback (carries a zone offset).
+        ColumnKind::Time
+    } else if dt == "uuid" {
+        ColumnKind::Uuid
+    } else if dt == "bytea" {
+        ColumnKind::Bytea
+    } else if dt == "inet" || dt == "cidr" {
+        ColumnKind::Inet
     } else {
         ColumnKind::Text
     }
@@ -1385,9 +1419,10 @@ pub(crate) fn new_typed_column(kind: ColumnKind) -> TypedColumn {
         ColumnKind::Float32 => TypedColumn::Float32(Vec::new()),
         ColumnKind::Float64 => TypedColumn::Float64(Vec::new()),
         ColumnKind::Bool => TypedColumn::Bool(Vec::new()),
-        ColumnKind::Timestamp | ColumnKind::TimestampTz | ColumnKind::Date => {
+        ColumnKind::Timestamp | ColumnKind::TimestampTz | ColumnKind::Date | ColumnKind::Time => {
             TypedColumn::Int64(Vec::new())
         }
+        ColumnKind::Uuid | ColumnKind::Bytea | ColumnKind::Inet => TypedColumn::Bytes(Vec::new()),
     }
 }
 
@@ -1544,6 +1579,17 @@ fn append_row_to_columns(
                     }));
                 }
             }
+            ColumnKind::Time => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<pgrx::datum::Time>()
+                    .unwrap();
+                if let TypedColumn::Int64(vec) = &mut typed_cols[i] {
+                    // TimeADT is already microseconds since midnight
+                    vec.push(v.map(|t| t.into_inner()));
+                }
+            }
             ColumnKind::Text => {
                 let v = row
                     .get_datum_by_ordinal(ordinal)
@@ -1556,30 +1602,64 @@ fn append_row_to_columns(
             }
             ColumnKind::Jsonb => {
                 // Classic compression path (post-INSERT). SPI returns native
-                // jsonb Datums (not text). Read as JsonB and re-materialize to
-                // extract the binary varlena payload; fall back to jsonb_out
-                // text + jsonb_in for callers that still deliver JSON text.
-                let entry = row.get_datum_by_ordinal(ordinal).unwrap();
-                let bytes_opt = entry
-                    .value::<pgrx::datum::JsonB>()
-                    .ok()
-                    .flatten()
-                    .map(|jb| unsafe {
-                        jsonb_datum_to_binary(
-                            jb.into_datum().expect("jsonb value must convert to datum"),
-                        )
-                    })
-                    .or_else(|| {
-                        entry
-                            .value::<String>()
-                            .ok()
-                            .flatten()
-                            .map(|t| unsafe { jsonb_text_to_binary(&t) })
-                    });
+                // jsonb Datums, so we read the on-disk binary varlena payload
+                // directly via `JsonbRaw` — no jsonb_out/serde_json/jsonb_in
+                // round-trip (which would be lossy for high-precision numbers
+                // and leak a jsonb_in datum per row). The bytes are the same
+                // canonical jsonb container the COPY path produces via
+                // `jsonb_text_to_binary`, so the scan path is unaffected.
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<JsonbRaw>()
+                    .unwrap();
                 if let TypedColumn::Bytes(vec) = &mut typed_cols[i] {
-                    vec.push(bytes_opt);
+                    vec.push(v.map(|j| j.0));
                 }
             }
+            ColumnKind::Uuid => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<UuidRaw>()
+                    .unwrap();
+                if let TypedColumn::Bytes(vec) = &mut typed_cols[i] {
+                    vec.push(v.map(|u| u.0.to_vec()));
+                }
+            }
+            ColumnKind::Bytea | ColumnKind::Inet => {
+                // Same raw-varlena-payload read as jsonb: detoast and copy
+                // the bytes after the varlena header.
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<JsonbRaw>()
+                    .unwrap();
+                if let TypedColumn::Bytes(vec) = &mut typed_cols[i] {
+                    vec.push(v.map(|j| j.0));
+                }
+            }
+        }
+    }
+}
+
+/// A fixed-length pass-by-reference Datum (uuid: 16 bytes) read verbatim.
+pub(crate) struct UuidRaw(pub [u8; 16]);
+
+impl FromDatum for UuidRaw {
+    unsafe fn from_polymorphic_datum(
+        datum: pgrx::pg_sys::Datum,
+        is_null: bool,
+        _typoid: pgrx::pg_sys::Oid,
+    ) -> Option<Self> {
+        if is_null {
+            return None;
+        }
+        unsafe {
+            let ptr = datum.cast_mut_ptr::<u8>();
+            let mut bytes = [0u8; 16];
+            std::ptr::copy_nonoverlapping(ptr, bytes.as_mut_ptr(), 16);
+            Some(UuidRaw(bytes))
         }
     }
 }
@@ -1594,15 +1674,76 @@ thread_local! {
         const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
-/// Extract the binary jsonb varlena payload (everything after the varlena
-/// header) from an existing jsonb Datum returned by SPI.
-pub(crate) unsafe fn jsonb_datum_to_binary(datum: pgrx::pg_sys::Datum) -> Vec<u8> {
-    unsafe {
-        let varlena = datum.cast_mut_ptr::<pgrx::pg_sys::varlena>();
-        let detoasted = pgrx::pg_sys::pg_detoast_datum(varlena);
-        let total_len = pgrx::varsize_any_exhdr(detoasted);
-        let data_ptr = pgrx::vardata_any(detoasted).cast::<u8>();
-        std::slice::from_raw_parts(data_ptr, total_len).to_vec()
+/// A `jsonb` Datum read as its raw on-disk binary varlena payload (everything
+/// after the varlena header), with no parse/serialize round-trip.
+///
+/// Reading a `jsonb` column via pgrx's `JsonB` would route the value through
+/// `jsonb_out` → `serde_json::Value` → `jsonb_in`, which is both expensive and
+/// lossy: pgrx's `serde_json` has no `arbitrary_precision`, so numbers outside
+/// i64/u64/f64 range (high-precision decimals, large integers) get rounded.
+/// We instead detoast and copy the binary container verbatim — the same bytes
+/// `jsonb_text_to_binary` produces, so the scan path reconstructs identically.
+pub(crate) struct JsonbRaw(pub Vec<u8>);
+
+impl FromDatum for JsonbRaw {
+    unsafe fn from_polymorphic_datum(
+        datum: pgrx::pg_sys::Datum,
+        is_null: bool,
+        _typoid: pgrx::pg_sys::Oid,
+    ) -> Option<Self> {
+        if is_null {
+            return None;
+        }
+        unsafe {
+            let varlena = datum.cast_mut_ptr::<pgrx::pg_sys::varlena>();
+            let detoasted = pgrx::pg_sys::pg_detoast_datum(varlena);
+            let total_len = pgrx::varsize_any_exhdr(detoasted);
+            let data_ptr = pgrx::vardata_any(detoasted).cast::<u8>();
+            let bytes = std::slice::from_raw_parts(data_ptr, total_len).to_vec();
+            // pg_detoast_datum allocates a copy in CurrentMemoryContext only
+            // when the datum was actually toasted; free it so a long compress
+            // loop doesn't accumulate detoasted copies.
+            if detoasted != varlena {
+                pgrx::pg_sys::pfree(detoasted.cast());
+            }
+            Some(JsonbRaw(bytes))
+        }
+    }
+}
+
+impl IntoDatum for JsonbRaw {
+    fn into_datum(self) -> Option<pgrx::pg_sys::Datum> {
+        // Read-only helper: only the FromDatum side is used (via SpiHeapTupleDataEntry::value).
+        // Required by the IntoDatum bound on `value::<T>()` and the binary-coercibility check.
+        unreachable!("JsonbRaw is read-only and must not be converted back into a Datum")
+    }
+
+    fn type_oid() -> pgrx::pg_sys::Oid {
+        pgrx::pg_sys::JSONBOID
+    }
+
+    fn is_compatible_with(other: pgrx::pg_sys::Oid) -> bool {
+        // JsonbRaw is a generic "detoasted varlena payload" reader — the
+        // bytea/inet native codecs reuse it to capture their raw payload
+        // bytes (see the Bytea/Inet extraction arms).
+        matches!(
+            other,
+            pgrx::pg_sys::JSONBOID
+                | pgrx::pg_sys::BYTEAOID
+                | pgrx::pg_sys::INETOID
+                | pgrx::pg_sys::CIDROID
+        )
+    }
+}
+
+impl IntoDatum for UuidRaw {
+    fn into_datum(self) -> Option<pgrx::pg_sys::Datum> {
+        // Read-only helper, same contract as JsonbRaw.
+        unreachable!("UuidRaw is read-only and must not be converted back into a Datum")
+    }
+
+    fn type_oid() -> pgrx::pg_sys::Oid {
+        pgrx::pg_sys::UUIDOID
     }
 }
 
@@ -1613,29 +1754,17 @@ pub(crate) unsafe fn jsonb_datum_to_binary(datum: pgrx::pg_sys::Datum) -> Vec<u8
 /// in datum_utils.
 pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
     unsafe {
-        let scratch = JSONB_SCRATCH_CTX.with(|c| {
-            let p = c.get();
-            if p.is_null() {
-                let new_ctx = pgrx::pg_sys::AllocSetContextCreateInternal(
-                    pgrx::pg_sys::TopMemoryContext,
-                    c"pg_deltax_jsonb_scratch".as_ptr(),
-                    pgrx::pg_sys::ALLOCSET_SMALL_MINSIZE as usize,
-                    pgrx::pg_sys::ALLOCSET_SMALL_INITSIZE as usize,
-                    pgrx::pg_sys::ALLOCSET_SMALL_MAXSIZE as usize,
-                );
-                c.set(new_ctx);
-                new_ctx
-            } else {
-                p
-            }
-        });
+        let scratch = jsonb_scratch_ctx();
 
         let old = pgrx::pg_sys::MemoryContextSwitchTo(scratch);
 
-        // Legacy billing rows may carry NUL in jsonb text; strip so decompress can complete.
+        // Legacy billing rows may carry NUL in jsonb text; strip so decompress can
+        // complete. Without this the CString::new panics and the partition is left
+        // permanently read-only. Carried over from main (e056fc4) during this merge —
+        // chore/suporte-pg19 still had the panicking form.
         let sanitized: String = text.chars().filter(|c| *c != '\0').collect();
-        let c_text = std::ffi::CString::new(sanitized)
-            .expect("jsonb text contains null byte after sanitize");
+        let c_text =
+            std::ffi::CString::new(sanitized).expect("jsonb text contains null byte after sanitize");
         let mut typinput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
         let mut typioparam: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
         pgrx::pg_sys::getTypeInputInfo(pgrx::pg_sys::JSONBOID, &mut typinput, &mut typioparam);
@@ -1655,27 +1784,91 @@ pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
     }
 }
 
-/// Render a binary jsonb varlena payload (post-header bytes) as a SQL literal.
-unsafe fn jsonb_payload_to_sql_literal(payload: &[u8]) -> String {
+/// Lazily create (once per backend) and return the scratch memory context
+/// used by the per-row jsonb conversions above/below.
+unsafe fn jsonb_scratch_ctx() -> pgrx::pg_sys::MemoryContext {
     unsafe {
-        const VARHDRSZ: usize = pgrx::pg_sys::VARHDRSZ;
-        let total_len = (VARHDRSZ + payload.len()) as i32;
-        let varlena = pgrx::pg_sys::palloc(total_len as usize) as *mut pgrx::pg_sys::varlena;
-        pgrx::set_varsize_4b(varlena, total_len);
-        if !payload.is_empty() {
+        JSONB_SCRATCH_CTX.with(|c| {
+            let p = c.get();
+            if p.is_null() {
+                let new_ctx = pgrx::pg_sys::AllocSetContextCreateInternal(
+                    pgrx::pg_sys::TopMemoryContext,
+                    c"pg_deltax_jsonb_scratch".as_ptr(),
+                    pgrx::pg_sys::ALLOCSET_SMALL_MINSIZE as usize,
+                    pgrx::pg_sys::ALLOCSET_SMALL_INITSIZE as usize,
+                    pgrx::pg_sys::ALLOCSET_SMALL_MAXSIZE as usize,
+                );
+                c.set(new_ctx);
+                new_ctx
+            } else {
+                p
+            }
+        })
+    }
+}
+
+/// A type's output function resolved once, for converting stored binary
+/// payloads (jsonb container bytes, uuid bytes, bytea/inet varlena payloads)
+/// back to their canonical text inside per-value loops. Hoists the
+/// `getTypeOutputInfo` syscache lookup and the `fmgr_info` resolution out of
+/// the loop. Must only be used on the main backend thread.
+pub(crate) struct TypeOutFn {
+    finfo: pgrx::pg_sys::FmgrInfo,
+}
+
+impl TypeOutFn {
+    pub(crate) unsafe fn resolve(type_oid: pgrx::pg_sys::Oid) -> Self {
+        unsafe {
+            let mut typoutput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
+            let mut typisvarlena: bool = false;
+            pgrx::pg_sys::getTypeOutputInfo(type_oid, &mut typoutput, &mut typisvarlena);
+            let mut finfo = pgrx::pg_sys::FmgrInfo::default();
+            pgrx::pg_sys::fmgr_info(typoutput, &mut finfo);
+            Self { finfo }
+        }
+    }
+
+    unsafe fn call_out(&mut self, datum: pgrx::pg_sys::Datum) -> String {
+        unsafe {
+            let cstr = pgrx::pg_sys::OutputFunctionCall(&mut self.finfo, datum);
+            let text = std::ffi::CStr::from_ptr(cstr)
+                .to_str()
+                .expect("type output function produced invalid UTF-8")
+                .to_string();
+            pgrx::pg_sys::pfree(cstr.cast());
+            text
+        }
+    }
+
+    /// Wrap `payload` (the bytes after the varlena header) in a fresh varlena
+    /// header and call the type's output function. For jsonb this is the
+    /// exact inverse of `jsonb_text_to_binary`.
+    pub(crate) unsafe fn render(&mut self, payload: &[u8]) -> String {
+        unsafe {
+            let total_len = pgrx::pg_sys::VARHDRSZ + payload.len();
+            let varlena = pgrx::pg_sys::palloc(total_len) as *mut pgrx::pg_sys::varlena;
+            pgrx::set_varsize_4b(varlena, total_len as i32);
             std::ptr::copy_nonoverlapping(
                 payload.as_ptr(),
-                (varlena as *mut u8).add(VARHDRSZ),
+                (varlena as *mut u8).add(pgrx::pg_sys::VARHDRSZ),
                 payload.len(),
             );
+            let text = self.call_out(pgrx::pg_sys::Datum::from(varlena as usize));
+            pgrx::pg_sys::pfree(varlena.cast());
+            text
         }
-        let datum = pgrx::pg_sys::Datum::from(varlena as usize);
-        let mut typoutput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
-        let mut isvarlena = false;
-        pgrx::pg_sys::getTypeOutputInfo(pgrx::pg_sys::JSONBOID, &mut typoutput, &mut isvarlena);
-        let cstr_ptr = pgrx::pg_sys::OidOutputFunctionCall(typoutput, datum);
-        let text = std::ffi::CStr::from_ptr(cstr_ptr).to_string_lossy();
-        format!("'{}'::jsonb", text.replace('\'', "''"))
+    }
+
+    /// Render a fixed-length by-reference value (uuid: 16 bytes) — the datum
+    /// is a bare pointer to the bytes, no varlena header.
+    pub(crate) unsafe fn render_fixed(&mut self, bytes: &[u8]) -> String {
+        unsafe {
+            let buf = pgrx::pg_sys::palloc(bytes.len()) as *mut u8;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+            let text = self.call_out(pgrx::pg_sys::Datum::from(buf as usize));
+            pgrx::pg_sys::pfree(buf.cast());
+            text
+        }
     }
 }
 
@@ -2386,6 +2579,7 @@ pub(crate) struct CompanionDdl {
     pub(crate) blooms_ddl: String,
     pub(crate) text_lengths_ddl: String,
     pub(crate) valbitmap_ddl: String,
+    pub(crate) tombstones_ddl: String,
 }
 
 /// Cached probe result for whether the running PostgreSQL was built with
@@ -2524,6 +2718,17 @@ pub(crate) fn build_companion_ddl(part_table: &str, columns: &[ColumnMeta]) -> C
         valbitmap_fqn, lz4
     );
 
+    // P2.5 tombstones: one row per logically deleted segment row
+    // (`dev/docs/COMPRESSED_DML.md` P2.5). Ordinary heap rows ⇒ MVCC,
+    // rollback and replication are native. Created (empty) at compress time
+    // so the GRANT/OWNER cascade covers it; zero blocks = zero read-side
+    // cost. The PK doubles as the indexed existence probe.
+    let tombstones_fqn = format!("\"{}\".\"{}_tombstones\"", companion_schema, part_table);
+    let tombstones_ddl = format!(
+        "CREATE TABLE {} (_segment_id INT NOT NULL, _row_offset INT NOT NULL, PRIMARY KEY (_segment_id, _row_offset))",
+        tombstones_fqn
+    );
+
     CompanionDdl {
         meta_fqn,
         colstats_fqn,
@@ -2537,6 +2742,7 @@ pub(crate) fn build_companion_ddl(part_table: &str, columns: &[ColumnMeta]) -> C
         blooms_ddl,
         text_lengths_ddl,
         valbitmap_ddl,
+        tombstones_ddl,
     }
 }
 
@@ -2579,7 +2785,9 @@ fn compress_partition_streaming(
 
     // Build SELECT list: segment_by and text-classified cols cast to ::text,
     // others as native types. The ::text cast is needed for CHAR/VARCHAR
-    // columns which have different OIDs than text.
+    // columns which have different OIDs than text. jsonb must stay native:
+    // `append_row_to_columns` reads it as a raw binary varlena via `JsonbRaw`
+    // (no jsonb_out/jsonb_in round-trip, which would be lossy — see #27).
     let select_cols = columns
         .iter()
         .zip(kinds.iter())
@@ -2885,7 +3093,7 @@ fn compress_partition_streaming(
             use pgrx::datum::DatumWithOid;
             let insert_sql = format!(
                 "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
-                &ddl.blobs_fqn
+                ddl.blobs_fqn
             );
             let args: Vec<DatumWithOid> = vec![
                 (col_idx as i16).into(),
@@ -2910,7 +3118,7 @@ fn compress_partition_streaming(
                 use pgrx::datum::DatumWithOid;
                 let insert_sql = format!(
                     "INSERT INTO {} (_col_idx, _segment_id, _num_hashes, _data) VALUES ($1, $2, $3, $4)",
-                    &ddl.blooms_fqn
+                    ddl.blooms_fqn
                 );
                 let args: Vec<DatumWithOid> = vec![
                     (col_idx as i16).into(),
@@ -2940,7 +3148,7 @@ fn compress_partition_streaming(
                 use pgrx::datum::DatumWithOid;
                 let insert_sql = format!(
                     "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
-                    &ddl.text_lengths_fqn
+                    ddl.text_lengths_fqn
                 );
                 let args: Vec<DatumWithOid> = vec![
                     (col_idx as i16).into(),
@@ -3103,7 +3311,7 @@ fn finalize_and_insert_valbitmaps(
         use pgrx::datum::DatumWithOid;
         let insert_sql = format!(
             "INSERT INTO {} (_col_idx, _segment_id, _bits) VALUES ($1, $2, $3)",
-            &ddl.valbitmap_fqn
+            ddl.valbitmap_fqn
         );
         let args: Vec<DatumWithOid> = vec![
             (col_idx as i16).into(),
@@ -3221,13 +3429,33 @@ pub(crate) fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<
             .to_bytes()
         }
         TypedColumn::Text(values) => {
+            let dt = data_type.to_lowercase();
+            if (dt.starts_with("numeric") || dt.starts_with("decimal"))
+                && !crate::FORCE_TEXT_FALLBACK.get()
+            {
+                // Try the scaled-i64 numeric codec; per-blob text fallback for
+                // NaN/Infinity, mixed dscale, or mantissas beyond i64.
+                if let Some(blob) = compress_numeric_scaled(values) {
+                    return blob;
+                }
+            }
             // Delegate to existing string-based compression
             compress_column_values(values, data_type, "")
         }
         TypedColumn::Bytes(values) => {
-            // jsonb varlena payloads: treat as opaque byte blobs, reuse the
-            // same variable-length compression pipeline as text.
-            compress_byte_values(values)
+            let dt = data_type.to_lowercase();
+            if dt == "jsonb" {
+                // jsonb varlena payloads: treat as opaque byte blobs, reuse
+                // the same variable-length compression pipeline as text. Keeps
+                // the legacy text-family tags for on-disk compatibility —
+                // jsonb readers disambiguate by type oid, not by tag.
+                compress_byte_values(values)
+            } else {
+                // uuid/bytea/inet binary payloads: same pipeline, but with
+                // the Binary* tags so readers know these blobs hold raw bytes
+                // and not the legacy `::text` renderings.
+                compress_binary_values(values)
+            }
         }
     }
 }
@@ -3435,6 +3663,42 @@ fn compress_byte_values(values: &[Option<Vec<u8>>]) -> Vec<u8> {
     compress_column_values(&as_strings, "jsonb", "")
 }
 
+/// Compress raw binary payloads (uuid/bytea/inet) through the byte pipeline,
+/// then remap the codec tag to its Binary* variant. The blob layout is
+/// otherwise identical — only the tag byte differs, marking the payloads as
+/// raw bytes so the read side never routes them through the UTF-8 text or
+/// input-function paths.
+/// Encode a segment of `numeric_out` renderings as scaled-i64 mantissas
+/// (`CompressionType::NumericScaled`): data = [dscale][inner integer tag]
+/// [inner encoding]. Returns `None` when the segment doesn't qualify
+/// (see `compression::numeric_scaled::to_uniform_scaled`).
+fn compress_numeric_scaled(values: &[Option<String>]) -> Option<Vec<u8>> {
+    let (scaled, dscale) = compression::numeric_scaled::to_uniform_scaled(values)?;
+    let (non_null, null_bitmap) = compression::extract_nulls(&scaled);
+    let (inner_tag, encoded) = compression::bitpacked::best_encoding_i64(&non_null);
+    let mut data = Vec::with_capacity(2 + encoded.len());
+    data.push(dscale);
+    data.push(inner_tag as u8);
+    data.extend_from_slice(&encoded);
+    Some(
+        CompressedColumn {
+            type_tag: CompressionType::NumericScaled,
+            row_count: values.len() as u32,
+            null_bitmap,
+            data,
+        }
+        .to_bytes(),
+    )
+}
+
+fn compress_binary_values(values: &[Option<Vec<u8>>]) -> Vec<u8> {
+    let mut blob = compress_byte_values(values);
+    if let Some(tag) = blob.first_mut() {
+        *tag = CompressionType::from_u8(*tag).to_binary_variant() as u8;
+    }
+    blob
+}
+
 /// Get column metadata for a table.
 pub(crate) fn get_column_metadata(
     client: &SpiClient,
@@ -3525,11 +3789,197 @@ fn estimate_raw_size(client: &SpiClient, table_fqn: &str) -> i64 {
 // Decompression
 // ============================================================================
 
-/// One decompressed cell — text columns use UTF-8 strings; jsonb keeps raw bytes.
-#[derive(Clone)]
-enum DecompCell {
-    Text(String),
-    Bytes(Vec<u8>),
+/// Decode one segment's column blobs and INSERT the restored rows back into
+/// the partition heap. Shared by full decompression
+/// (`decompress_partition_inner`) and per-segment decompose-on-write
+/// (`decompose_segments_for_dml`). Reads the segment's blobs from the
+/// `_blobs` companion — so it must run BEFORE the caller deletes the
+/// segment's blob rows.
+///
+/// `non_seg_cols` is the positional `(col_idx, name, data_type)` mapping for
+/// non-segment-by physical columns (synthetic json-extract columns live at
+/// higher `_col_idx` values and are intentionally not restored — the
+/// original JSONB column is physical and lands in the heap row).
+///
+/// `skip_offsets` (P2.5 tombstones) lists 0-based row offsets that are
+/// logically deleted and must NOT be rematerialized — every restore path
+/// (full decompress, decompose-on-write, compaction rewrite) honors it.
+/// Returns the number of rows actually inserted (live rows).
+#[allow(clippy::too_many_arguments)]
+fn restore_segment_rows(
+    client: &mut SpiClient,
+    part_fqn: &str,
+    blobs_fqn: &str,
+    columns: &[ColumnMeta],
+    non_seg_cols: &[(u16, String, String)],
+    segment_id: i32,
+    segment_by_vals: &[Option<String>],
+    row_count: i32,
+    skip_offsets: Option<&std::collections::HashSet<i32>>,
+) -> i64 {
+    // Read blobs for this segment from the blobs table
+    let blob_query = format!(
+        "SELECT _col_idx, _data FROM {} WHERE _segment_id = $1 ORDER BY _col_idx",
+        blobs_fqn
+    );
+    let blob_rows = client
+        .select(&blob_query, None, &[segment_id.into()])
+        .expect("failed to read blobs");
+
+    let mut blob_map: std::collections::HashMap<u16, Vec<u8>> = std::collections::HashMap::new();
+    for brow in blob_rows {
+        let ci: i16 = brow
+            .get_datum_by_ordinal(1)
+            .unwrap()
+            .value::<i16>()
+            .unwrap()
+            .unwrap_or(0);
+        let data: Option<Vec<u8>> = brow
+            .get_datum_by_ordinal(2)
+            .unwrap()
+            .value::<Vec<u8>>()
+            .unwrap();
+        blob_map.insert(ci as u16, data.unwrap_or_default());
+    }
+
+    // Decompress all columns
+    let mut decompressed_cols: Vec<(String, Vec<Option<String>>)> = Vec::new();
+
+    // Segment-by columns: repeat the value for every row
+    let mut seg_idx = 0;
+    for col in columns {
+        if col.is_segment_by {
+            let val = &segment_by_vals[seg_idx];
+            let repeated: Vec<Option<String>> = (0..row_count).map(|_| val.clone()).collect();
+            decompressed_cols.push((col.name.clone(), repeated));
+            seg_idx += 1;
+        }
+    }
+
+    // Compressed columns: decompress from blob_map
+    for (ci, name, data_type) in non_seg_cols {
+        let blob = blob_map.get(ci).cloned().unwrap_or_default();
+        let values = if data_type.eq_ignore_ascii_case("jsonb") {
+            // jsonb blobs hold binary jsonb varlena payloads, not UTF-8 text:
+            // decode byte-safe, then convert back to JSON text via jsonb_out
+            // so the value can travel through the INSERT literal below.
+            let mut jsonb_out = unsafe { TypeOutFn::resolve(pgrx::pg_sys::JSONBOID) };
+            decompress_column_byte_values(&blob)
+                .into_iter()
+                .map(|opt| opt.map(|payload| unsafe { jsonb_out.render(&payload) }))
+                .collect()
+        } else {
+            decompress_column_values(&blob, data_type)
+        };
+        decompressed_cols.push((name.clone(), values));
+    }
+
+    // Sort columns back to original order
+    let mut ordered_cols: Vec<(String, Vec<Option<String>>)> = Vec::new();
+    for col in columns {
+        for dc in &decompressed_cols {
+            if dc.0 == col.name {
+                ordered_cols.push(dc.clone());
+                break;
+            }
+        }
+    }
+
+    // INSERT rows back into partition
+    let col_names: String = ordered_cols
+        .iter()
+        .map(|(name, _)| format!("\"{}\"", name))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    const BATCH_SIZE: usize = 1000;
+    let mut batch_start = 0;
+    let mut inserted: i64 = 0;
+    while batch_start < row_count as usize {
+        let batch_end = (batch_start + BATCH_SIZE).min(row_count as usize);
+
+        let mut all_row_values = Vec::with_capacity(batch_end - batch_start);
+        for row_idx in batch_start..batch_end {
+            if let Some(skip) = skip_offsets
+                && skip.contains(&(row_idx as i32))
+            {
+                continue; // tombstoned — logically deleted, do not resurrect
+            }
+            let vals: Vec<String> = ordered_cols
+                .iter()
+                .enumerate()
+                .map(|(col_idx, (_, values))| {
+                    let col_meta = &columns[col_idx];
+                    match &values[row_idx] {
+                        None => "NULL".to_string(),
+                        Some(v) => format_value_for_insert(v, &col_meta.data_type),
+                    }
+                })
+                .collect();
+            all_row_values.push(format!("({})", vals.join(", ")));
+        }
+        if !all_row_values.is_empty() {
+            inserted += all_row_values.len() as i64;
+            let insert_sql = format!(
+                "INSERT INTO {} ({}) VALUES {}",
+                part_fqn,
+                col_names,
+                all_row_values.join(", ")
+            );
+            client
+                .update(&insert_sql, None, &[])
+                .expect("failed to insert decompressed rows");
+        }
+
+        batch_start = batch_end;
+    }
+
+    inserted
+}
+
+/// Read tombstoned row offsets (P2.5) for the given segments — or all
+/// segments when `only_ids` is `None` — as `segment_id → set of offsets`.
+/// Returns an empty map when the tombstones table doesn't exist (data
+/// compressed before P2.5) or holds no matching rows.
+fn load_tombstone_offsets_sql(
+    client: &SpiClient,
+    tombstones_fqn: &str,
+    only_ids: Option<&[i32]>,
+) -> std::collections::HashMap<i32, std::collections::HashSet<i32>> {
+    let mut map: std::collections::HashMap<i32, std::collections::HashSet<i32>> =
+        std::collections::HashMap::new();
+    if !relation_exists(client, tombstones_fqn) {
+        return map;
+    }
+    let where_clause = match only_ids {
+        Some([]) => return map,
+        Some(ids) => format!(
+            " WHERE _segment_id IN ({})",
+            ids.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => String::new(),
+    };
+    let rows = client
+        .select(
+            &format!(
+                "SELECT _segment_id, _row_offset FROM {}{}",
+                tombstones_fqn, where_clause
+            ),
+            None,
+            &[],
+        )
+        .expect("failed to read tombstones");
+    for row in rows {
+        let sid: Option<i32> = row.get(1).ok().flatten();
+        let off: Option<i32> = row.get(2).ok().flatten();
+        if let (Some(sid), Some(off)) = (sid, off) {
+            map.entry(sid).or_default().insert(off);
+        }
+    }
+    map
 }
 
 fn decompress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
@@ -3581,9 +4031,14 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
     let text_lengths_fqn = format!("\"{}\".\"{}_text_lengths\"", companion_schema, part_table);
     let valbitmap_fqn = format!("\"{}\".\"{}_valbitmap\"", companion_schema, part_table);
+    let tombstones_fqn = format!("\"{}\".\"{}_tombstones\"", companion_schema, part_table);
     let part_fqn = crate::partition::fqn(&schema, &part_table);
     catalog::drop_compressed_dml_trigger(client, &schema, &part_table)
         .expect("failed to drop compressed partition DML trigger");
+
+    // P2.5: tombstoned rows are logically deleted — they must not be
+    // rematerialized by the full decompress.
+    let tombstones = load_tombstone_offsets_sql(client, &tombstones_fqn, None);
 
     // 3. Read compressed segments from meta + blobs tables
 
@@ -3664,132 +4119,17 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         if seg_meta.row_count == 0 {
             continue;
         }
-
-        // Read blobs for this segment from the blobs table
-        let blob_query = format!(
-            "SELECT _col_idx, _data FROM {} WHERE _segment_id = $1 ORDER BY _col_idx",
-            blobs_fqn
+        total_rows_restored += restore_segment_rows(
+            client,
+            &part_fqn,
+            &blobs_fqn,
+            &columns,
+            &non_seg_cols,
+            seg_meta.segment_id,
+            &seg_meta.segment_by_vals,
+            seg_meta.row_count,
+            tombstones.get(&seg_meta.segment_id),
         );
-        let blob_rows = client
-            .select(&blob_query, None, &[seg_meta.segment_id.into()])
-            .expect("failed to read blobs");
-
-        let mut blob_map: std::collections::HashMap<u16, Vec<u8>> =
-            std::collections::HashMap::new();
-        for brow in blob_rows {
-            let ci: i16 = brow
-                .get_datum_by_ordinal(1)
-                .unwrap()
-                .value::<i16>()
-                .unwrap()
-                .unwrap_or(0);
-            let data: Option<Vec<u8>> = brow
-                .get_datum_by_ordinal(2)
-                .unwrap()
-                .value::<Vec<u8>>()
-                .unwrap();
-            blob_map.insert(ci as u16, data.unwrap_or_default());
-        }
-
-        // Decompress all columns
-        let mut decompressed_cols: Vec<(String, Vec<Option<DecompCell>>)> = Vec::new();
-
-        // Segment-by columns: repeat the value for every row
-        let mut seg_idx = 0;
-        for col in &columns {
-            if col.is_segment_by {
-                let val = &seg_meta.segment_by_vals[seg_idx];
-                let repeated: Vec<Option<DecompCell>> = (0..seg_meta.row_count)
-                    .map(|_| val.as_ref().map(|s| DecompCell::Text(s.clone())))
-                    .collect();
-                decompressed_cols.push((col.name.clone(), repeated));
-                seg_idx += 1;
-            }
-        }
-
-        // Compressed columns: decompress from blob_map
-        for (ci, name, data_type) in &non_seg_cols {
-            let blob = blob_map.get(ci).cloned().unwrap_or_default();
-            if data_type.to_lowercase() == "jsonb" {
-                let values = decompress_column_byte_values(&blob);
-                decompressed_cols.push((
-                    name.clone(),
-                    values
-                        .into_iter()
-                        .map(|o| o.map(DecompCell::Bytes))
-                        .collect(),
-                ));
-            } else {
-                let values = decompress_column_values(&blob, data_type);
-                decompressed_cols.push((
-                    name.clone(),
-                    values
-                        .into_iter()
-                        .map(|o| o.map(DecompCell::Text))
-                        .collect(),
-                ));
-            }
-        }
-
-        // Sort columns back to original order
-        let mut ordered_cols: Vec<(String, Vec<Option<DecompCell>>)> = Vec::new();
-        for col in &columns {
-            for dc in &decompressed_cols {
-                if dc.0 == col.name {
-                    ordered_cols.push(dc.clone());
-                    break;
-                }
-            }
-        }
-        let segment_row_count = seg_meta.row_count;
-
-        // INSERT rows back into partition
-        let col_names: String = ordered_cols
-            .iter()
-            .map(|(name, _)| format!("\"{}\"", name))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        const BATCH_SIZE: usize = 1000;
-        let mut batch_start = 0;
-        while batch_start < segment_row_count as usize {
-            let batch_end = (batch_start + BATCH_SIZE).min(segment_row_count as usize);
-
-            let mut all_row_values = Vec::with_capacity(batch_end - batch_start);
-            for row_idx in batch_start..batch_end {
-                let vals: Vec<String> = ordered_cols
-                    .iter()
-                    .enumerate()
-                    .map(|(col_idx, (_, values))| {
-                        let col_meta = &columns[col_idx];
-                        match &values[row_idx] {
-                            None => "NULL".to_string(),
-                            Some(DecompCell::Text(v)) => {
-                                format_value_for_insert(v, &col_meta.data_type)
-                            }
-                            Some(DecompCell::Bytes(b)) => unsafe {
-                                jsonb_payload_to_sql_literal(b)
-                            },
-                        }
-                    })
-                    .collect();
-                all_row_values.push(format!("({})", vals.join(", ")));
-            }
-
-            let insert_sql = format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                part_fqn,
-                col_names,
-                all_row_values.join(", ")
-            );
-            client
-                .update(&insert_sql, None, &[])
-                .expect("failed to insert decompressed rows");
-
-            batch_start = batch_end;
-        }
-
-        total_rows_restored += segment_row_count as i64;
     }
 
     // 4. Drop meta + colstats + blobs + blooms + text_lengths + valbitmap tables
@@ -3817,6 +4157,13 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         .update(&format!("DROP TABLE IF EXISTS {}", colstats_fqn), None, &[])
         .expect("failed to drop colstats table");
     client
+        .update(
+            &format!("DROP TABLE IF EXISTS {}", tombstones_fqn),
+            None,
+            &[],
+        )
+        .expect("failed to drop tombstones table");
+    client
         .update(&format!("DROP TABLE IF EXISTS {}", meta_fqn), None, &[])
         .expect("failed to drop meta table");
 
@@ -3831,38 +4178,6 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     )
 }
 
-/// Decompress a jsonb column blob, preserving raw binary payloads (no UTF-8).
-fn decompress_column_byte_values(blob: &[u8]) -> Vec<Option<Vec<u8>>> {
-    if blob.is_empty() {
-        return Vec::new();
-    }
-
-    let cc = CompressedColumn::from_bytes(blob);
-    let total_count = cc.row_count as usize;
-    let non_null = count_non_null(&cc.null_bitmap, total_count);
-
-    let values: Vec<Vec<u8>> = match cc.type_tag {
-        CompressionType::Dictionary => {
-            let slices = compression::dictionary::decode_to_byte_slices(&cc.data, non_null);
-            slices.iter().map(|s| s.to_vec()).collect()
-        }
-        CompressionType::DictionaryLz4 => {
-            let normalized = compression::dictionary::normalize_lz4(&cc.data);
-            let slices = compression::dictionary::decode_to_byte_slices(&normalized, non_null);
-            slices.iter().map(|s| s.to_vec()).collect()
-        }
-        CompressionType::Lz4 => compression::lz4::decode_bytes(&cc.data, non_null),
-        CompressionType::Lz4Blocked => compression::lz4::decode_bytes_blocked(&cc.data, non_null),
-        other => {
-            pgrx::error!(
-                "pg_deltax: unexpected compression type {:?} for jsonb decompress",
-                other
-            );
-        }
-    };
-    compression::reinsert_nulls(&values, &cc.null_bitmap, total_count)
-}
-
 /// Decompress a column blob back to string representations.
 fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>> {
     if blob.is_empty() {
@@ -3872,6 +4187,170 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
     let cc = CompressedColumn::from_bytes(blob);
     let total_count = cc.row_count as usize;
     let dt = data_type.to_lowercase();
+
+    // jsonb blobs store PG's BINARY jsonb varlena payload (not UTF-8 text — see
+    // `jsonb_text_to_binary` / `JsonbRaw`), so they must be decoded via the
+    // byte-level codec entry points and converted back to canonical JSON text
+    // through jsonb's output function. Routing them through the UTF-8-validating
+    // text decoders below panics with "invalid UTF-8 in dictionary" /
+    // "invalid UTF-8 in LZ4 data".
+    if dt == "jsonb" {
+        let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+        let mut jsonb_out = unsafe { TypeOutFn::resolve(pgrx::pg_sys::JSONBOID) };
+        let strings: Vec<String> = match cc.type_tag {
+            CompressionType::Dictionary => {
+                compression::dictionary::decode_to_byte_slices(&cc.data, non_null_count)
+                    .iter()
+                    .map(|b| unsafe { jsonb_out.render(b) })
+                    .collect()
+            }
+            CompressionType::DictionaryLz4 => {
+                let normalized = compression::dictionary::normalize_lz4(&cc.data);
+                compression::dictionary::decode_to_byte_slices(&normalized, non_null_count)
+                    .iter()
+                    .map(|b| unsafe { jsonb_out.render(b) })
+                    .collect()
+            }
+            CompressionType::Lz4 => {
+                let (buf, ranges) = compression::lz4::decode_to_ranges(&cc.data, non_null_count);
+                ranges
+                    .iter()
+                    .map(|&(off, len)| unsafe { jsonb_out.render(&buf[off..off + len]) })
+                    .collect()
+            }
+            CompressionType::Lz4Blocked => {
+                let (buf, ranges) =
+                    compression::lz4::decode_to_ranges_blocked(&cc.data, non_null_count, None);
+                ranges
+                    .iter()
+                    .map(|&(off, len)| unsafe { jsonb_out.render(&buf[off..off + len]) })
+                    .collect()
+            }
+            other => pgrx::error!(
+                "pg_deltax: unexpected compression type {:?} for jsonb column",
+                other
+            ),
+        };
+        return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
+    }
+
+    // Binary-tag blobs (uuid/bytea/inet native codecs) hold the type's raw
+    // binary payload; render back to canonical text via the type's output
+    // function for the re-INSERT.
+    if matches!(
+        cc.type_tag,
+        CompressionType::BinaryDictionary
+            | CompressionType::BinaryDictionaryLz4
+            | CompressionType::BinaryLz4Blocked
+    ) {
+        let (type_oid, is_fixed_len) = match dt.as_str() {
+            "uuid" => (pgrx::pg_sys::UUIDOID, true),
+            "bytea" => (pgrx::pg_sys::BYTEAOID, false),
+            "inet" => (pgrx::pg_sys::INETOID, false),
+            "cidr" => (pgrx::pg_sys::CIDROID, false),
+            other => pgrx::error!(
+                "pg_deltax: unexpected binary-tag blob for column type {}",
+                other
+            ),
+        };
+        let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+        let mut out_fn = unsafe { TypeOutFn::resolve(type_oid) };
+        let mut render = |b: &[u8]| -> String {
+            unsafe {
+                if is_fixed_len {
+                    out_fn.render_fixed(b)
+                } else {
+                    out_fn.render(b)
+                }
+            }
+        };
+        let strings: Vec<String> = match cc.type_tag {
+            CompressionType::BinaryDictionary => {
+                compression::dictionary::decode_to_byte_slices(&cc.data, non_null_count)
+                    .iter()
+                    .map(|b| render(b))
+                    .collect()
+            }
+            CompressionType::BinaryDictionaryLz4 => {
+                let normalized = compression::dictionary::normalize_lz4(&cc.data);
+                compression::dictionary::decode_to_byte_slices(&normalized, non_null_count)
+                    .iter()
+                    .map(|b| render(b))
+                    .collect()
+            }
+            CompressionType::BinaryLz4Blocked => {
+                let (buf, ranges) =
+                    compression::lz4::decode_to_ranges_blocked(&cc.data, non_null_count, None);
+                ranges
+                    .iter()
+                    .map(|&(off, len)| render(&buf[off..off + len]))
+                    .collect()
+            }
+            _ => unreachable!(),
+        };
+        return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
+    }
+
+    // NumericScaled blobs: decode the scaled-i64 mantissas and render the
+    // exact numeric_out text back (pure Rust inverse of the write side).
+    if cc.type_tag == CompressionType::NumericScaled {
+        let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+        let dscale = cc.data[0];
+        let inner_tag = CompressionType::from_u8(cc.data[1]);
+        let payload = &cc.data[2..];
+        let ints: Vec<i64> = match inner_tag {
+            CompressionType::DeltaVarint => {
+                compression::integer::decode_i64(payload, non_null_count)
+            }
+            CompressionType::Constant => {
+                compression::bitpacked::decode_constant_i64(payload, non_null_count)
+            }
+            CompressionType::ForBitpacked => {
+                compression::bitpacked::decode_for_i64(payload, non_null_count)
+            }
+            other => pgrx::error!(
+                "pg_deltax: unexpected inner tag {:?} in NumericScaled blob",
+                other
+            ),
+        };
+        let strings: Vec<String> = ints
+            .iter()
+            .map(|&m| compression::numeric_scaled::format_numeric_scaled(m, dscale))
+            .collect();
+        return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
+    }
+
+    // time columns: integer-tag blobs (native codec) hold microseconds since
+    // midnight and must be rendered as 'HH:MM:SS[.ffffff]' for the re-INSERT.
+    // Legacy text-tag blobs hold the time's text rendering already and fall
+    // through to the generic dictionary/LZ4 arms below.
+    if (dt == "time" || dt == "time without time zone")
+        && matches!(
+            cc.type_tag,
+            CompressionType::DeltaVarint
+                | CompressionType::Constant
+                | CompressionType::ForBitpacked
+        )
+    {
+        let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+        let usecs: Vec<i64> = match cc.type_tag {
+            CompressionType::DeltaVarint => {
+                compression::integer::decode_i64(&cc.data, non_null_count)
+            }
+            CompressionType::Constant => {
+                compression::bitpacked::decode_constant_i64(&cc.data, non_null_count)
+            }
+            CompressionType::ForBitpacked => {
+                compression::bitpacked::decode_for_i64(&cc.data, non_null_count)
+            }
+            _ => unreachable!(),
+        };
+        let strings: Vec<String> = usecs
+            .iter()
+            .map(|&u| crate::timeparse::usec_to_time_string(u))
+            .collect();
+        return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
+    }
 
     match cc.type_tag {
         CompressionType::Gorilla => {
@@ -3971,6 +4450,16 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
                 .collect();
             compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
         }
+        // Handled by the early-return branches above for the types that
+        // write these tags; anything else is corrupt.
+        CompressionType::BinaryDictionary
+        | CompressionType::BinaryDictionaryLz4
+        | CompressionType::BinaryLz4Blocked
+        | CompressionType::NumericScaled => pgrx::error!(
+            "pg_deltax: unexpected {:?} blob for column type {}",
+            cc.type_tag,
+            dt
+        ),
         CompressionType::Constant => {
             let non_null_count = count_non_null(&cc.null_bitmap, total_count);
             if dt == "smallint" || dt == "int2" {
@@ -4004,6 +4493,57 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
             }
         }
     }
+}
+
+/// Byte-level counterpart of `decompress_column_values` for jsonb columns,
+/// whose stored values are binary jsonb varlena payloads (NOT UTF-8 text —
+/// see `compress_byte_values`). Decodes through the byte-safe codec variants
+/// so no UTF-8 validation runs on the payload bytes.
+fn decompress_column_byte_values(blob: &[u8]) -> Vec<Option<Vec<u8>>> {
+    if blob.is_empty() {
+        return Vec::new();
+    }
+
+    let cc = CompressedColumn::from_bytes(blob);
+    let total_count = cc.row_count as usize;
+    let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+
+    let bytes: Vec<Vec<u8>> = match cc.type_tag {
+        CompressionType::Dictionary => {
+            compression::dictionary::decode_to_byte_slices(&cc.data, non_null_count)
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect()
+        }
+        CompressionType::DictionaryLz4 => {
+            let normalized = compression::dictionary::normalize_lz4(&cc.data);
+            compression::dictionary::decode_to_byte_slices(&normalized, non_null_count)
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect()
+        }
+        CompressionType::Lz4 => {
+            let (buf, ranges) = compression::lz4::decode_to_ranges(&cc.data, non_null_count);
+            ranges
+                .iter()
+                .map(|&(off, len)| buf[off..off + len].to_vec())
+                .collect()
+        }
+        CompressionType::Lz4Blocked => {
+            let (buf, ranges) =
+                compression::lz4::decode_to_ranges_blocked(&cc.data, non_null_count, None);
+            ranges
+                .iter()
+                .map(|&(off, len)| buf[off..off + len].to_vec())
+                .collect()
+        }
+        other => pgrx::error!(
+            "pg_deltax: unexpected compression tag {:?} for a jsonb column blob",
+            other
+        ),
+    };
+
+    compression::reinsert_nulls(&bytes, &cc.null_bitmap, total_count)
 }
 
 /// Count non-null values given a null bitmap and total count.
@@ -4055,6 +4595,8 @@ pub(crate) fn supports_minmax(data_type: &str) -> bool {
     let dt = data_type.to_lowercase();
     dt.contains("timestamp")
         || dt == "date"
+        || dt == "time"
+        || dt == "time without time zone"
         || dt == "integer"
         || dt == "int4"
         || dt == "bigint"
@@ -4440,6 +4982,1775 @@ pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::Deltat
     compressed
 }
 
+// ============================================================================
+// P1 compaction: fold loose heap rows (transparent INSERTs into compressed
+// partitions) into new segments appended to the existing companion tables.
+// See dev/docs/COMPRESSED_DML.md §4.5.
+// ============================================================================
+
+// ============================================================================
+// P2 decompose-on-write (COMPRESSED_DML.md §5): per-segment decompose for
+// transparent UPDATE/DELETE on compressed partitions.
+// ============================================================================
+
+/// Outcome of `decompose_segments_for_dml`. Counts reflect only segments
+/// actually claimed by THIS transaction (the delete-first protocol skips
+/// segments a concurrent transaction decomposed first).
+pub(crate) struct DmlDecomposeStats {
+    /// Rows restored into the partition heap from decomposed segments.
+    pub(crate) restored_rows: i64,
+    pub(crate) decomposed_segments: usize,
+    /// Segments removed by the whole-segment DELETE fast path (§5.4) —
+    /// their rows were never materialized.
+    pub(crate) dropped_segments: usize,
+    /// Logical rows removed by whole-segment drops (command-tag credit).
+    pub(crate) dropped_rows: i64,
+}
+
+/// Decompose the given segments of a compressed partition back into ordinary
+/// heap rows (`decompose_ids`), and/or drop them outright (`drop_ids`,
+/// whole-segment DELETE fast path). Runs inside the user's transaction from
+/// the ExecutorStart interceptor, BEFORE the UPDATE/DELETE executes.
+///
+/// Mechanics per segment: delete its `_meta` row (claim), decode its blobs
+/// into rows inserted into the partition heap (skipped for `drop_ids`),
+/// then delete its sidecar rows in `_colstats`/`_blobs`/`_blooms`/
+/// `_text_lengths`/`_valbitmap`. Everything is plain WAL-logged heap DML in
+/// one transaction, so MVCC, rollback and crash recovery need no
+/// extension-side machinery (§5.3).
+///
+/// Locking & concurrency (§5.5): takes the same ACCESS EXCLUSIVE lock on the
+/// partition that compaction takes, held to end of transaction. Because
+/// every user DML already holds ROW EXCLUSIVE from planning, two concurrent
+/// DMLs on the same compressed partition cannot interleave here — one
+/// blocks (or the deadlock detector cancels one of them; the survivor is
+/// always correct). The meta-row delete is the serialization point proper:
+/// delete-first wins; a claim that deletes 0 rows means a concurrent
+/// transaction already decomposed that segment and it is skipped. Under
+/// REPEATABLE READ/SERIALIZABLE a lost claim surfaces as a serialization
+/// error, matching vanilla PostgreSQL semantics. Readers that only hold
+/// ACCESS SHARE block for the duration of the writing transaction — the
+/// honest cost of decompose-on-write; reads either see the segment intact
+/// (pre-commit snapshot) or the heap rows (post-commit), never both/neither.
+///
+/// Sidecar/metadata effects (§6):
+/// - Catalog `column_minmax` is NOT recomputed: a range covering removed
+///   values merely over-covers, which can only disable a pruning
+///   opportunity (segments scanned unnecessarily) — never produce a wrong
+///   answer. The same rule applies to partition-level bloom sentinels
+///   (`_segment_id = -1`, PERF #47 — not on this branch) when they land.
+/// - `column_valmap`/HLL/MCV/pg_statistic go stale (planner-only; refreshed
+///   by the next compaction or recompress).
+/// - Catalog `row_count`/`compressed_size` are decremented.
+/// - `max_segment_id` is raised to the current meta maximum BEFORE deleting,
+///   so a later compaction can never reuse a decomposed segment's id —
+///   the shared blob/decompressed caches and the backend-local colstats
+///   cache are keyed by `(companion_oid, segment_id, ...)` and id reuse
+///   within one companion-table lifetime would poison them.
+pub(crate) fn decompose_segments_for_dml(
+    partition_oid: pg_sys::Oid,
+    decompose_ids: &[i32],
+    drop_ids: &[i32],
+) -> DmlDecomposeStats {
+    let mut stats = DmlDecomposeStats {
+        restored_rows: 0,
+        decomposed_segments: 0,
+        dropped_segments: 0,
+        dropped_rows: 0,
+    };
+    if decompose_ids.is_empty() && drop_ids.is_empty() {
+        return stats;
+    }
+
+    // Internal DML below (companion deletes + heap inserts) must bypass the
+    // ExecutorStart interception and plan against the plain heap. Guard
+    // resets the flag on every exit path, including errors.
+    let _bypass = DmlBypassGuard::new();
+    // Tag the restored-row heap inserts + companion deletes with the
+    // deltax_internal replication origin so origin=none logical subscribers
+    // filter them (the user's own UPDATE/DELETE runs AFTER this returns, with
+    // the origin reset, so it replicates normally). See COMPRESSED_DML.md §7.
+    let _origin = InternalOriginGuard::new();
+
+    let (schema, part_table) = partition_names_for_oid(partition_oid);
+
+    Spi::connect_mut(|client| {
+        let Some(part_info) = catalog::get_partition_by_name(client, &schema, &part_table)
+            .expect("failed to query partition")
+        else {
+            return;
+        };
+        if !part_info.is_compressed {
+            // Raced with a full decompress — the rows are already plain
+            // heap tuples and the DML needs no help.
+            return;
+        }
+        let ht = catalog::get_deltatable_by_id(client, part_info.deltatable_id)
+            .expect("failed to query deltatable")
+            .unwrap();
+
+        // Decompose restores the parent table's physical columns only —
+        // synthetic json_extract columns live solely in the companion blobs
+        // (the physical JSONB column carries the data into the heap row).
+        let columns = get_column_metadata(
+            client,
+            &ht.schema_name,
+            &ht.table_name,
+            &ht.segment_by,
+            &ht.time_column,
+            None,
+        );
+
+        // Schema-drift guard (same rule as compaction): the positional
+        // col_idx mapping below assumes the column shape is unchanged since
+        // compression. Decomposing with a drifted shape would restore
+        // garbage — refuse and point at the full-rebuild path.
+        let cc_now = catalog::snapshot_compressed_columns(
+            client,
+            &ht.schema_name,
+            &ht.table_name,
+            &ht.segment_by,
+        )
+        .expect("failed to snapshot column shape");
+        let cc_now_val: serde_json::Value =
+            serde_json::from_str(&cc_now).unwrap_or(serde_json::Value::Null);
+        let shape_matches =
+            matches!(&part_info.compressed_columns, Some(stored) if *stored == cc_now_val);
+        if !shape_matches {
+            pgrx::error!(
+                "pg_deltax: cannot UPDATE/DELETE in compressed partition {}.{}: its column shape changed since compression; run deltax_decompress_partition() + deltax_compress_partition() first",
+                schema,
+                part_table
+            );
+        }
+
+        let companion_schema = "_deltax_compressed";
+        let meta_fqn = format!("\"{}\".\"{}_meta\"", companion_schema, part_table);
+        let colstats_fqn = format!("\"{}\".\"{}_colstats\"", companion_schema, part_table);
+        let blobs_fqn = format!("\"{}\".\"{}_blobs\"", companion_schema, part_table);
+        let blooms_fqn = format!("\"{}\".\"{}_blooms\"", companion_schema, part_table);
+        let text_lengths_fqn = format!("\"{}\".\"{}_text_lengths\"", companion_schema, part_table);
+        let valbitmap_fqn = format!("\"{}\".\"{}_valbitmap\"", companion_schema, part_table);
+        let tombstones_fqn = format!("\"{}\".\"{}_tombstones\"", companion_schema, part_table);
+        let part_fqn = crate::partition::fqn(&schema, &part_table);
+
+        // Serialize against compaction and concurrent decompose (§5.5).
+        client
+            .update(
+                &format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", part_fqn),
+                None,
+                &[],
+            )
+            .expect("failed to lock partition for decompose");
+
+        // Raise the segment-id high-water mark BEFORE any deletion so
+        // compaction can never reuse the ids we are about to remove.
+        client
+            .update(
+                &format!(
+                    "UPDATE deltax.deltax_partition
+                     SET max_segment_id = GREATEST(COALESCE(max_segment_id, 0),
+                         (SELECT COALESCE(MAX(_segment_id), 0) FROM {}))
+                     WHERE id = $1",
+                    meta_fqn
+                ),
+                None,
+                &[part_info.id.into()],
+            )
+            .expect("failed to bump segment-id high-water mark");
+
+        let id_list = |ids: &[i32]| {
+            ids.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        // P2.5: tombstoned rows of the affected segments are already
+        // logically deleted — they must neither be rematerialized by the
+        // restore nor counted by the whole-drop's command-tag credit.
+        let all_target_ids: Vec<i32> = drop_ids
+            .iter()
+            .chain(decompose_ids.iter())
+            .copied()
+            .collect();
+        let tombstones = load_tombstone_offsets_sql(client, &tombstones_fqn, Some(&all_target_ids));
+
+        let mut removed_ids: Vec<i32> = Vec::new();
+
+        // Whole-segment DELETE fast path: claim + account, no row restore.
+        if !drop_ids.is_empty() {
+            let rows = client
+                .update(
+                    &format!(
+                        "DELETE FROM {} WHERE _segment_id IN ({}) RETURNING _segment_id, _row_count",
+                        meta_fqn,
+                        id_list(drop_ids)
+                    ),
+                    None,
+                    &[],
+                )
+                .expect("failed to claim segments for whole-segment delete");
+            for row in rows {
+                let sid: i32 = row
+                    .get_datum_by_ordinal(1)
+                    .unwrap()
+                    .value::<i32>()
+                    .unwrap()
+                    .unwrap_or(0);
+                let rc: i32 = row
+                    .get_datum_by_ordinal(2)
+                    .unwrap()
+                    .value::<i32>()
+                    .unwrap()
+                    .unwrap_or(0);
+                let tomb_count = tombstones.get(&sid).map_or(0, |s| s.len() as i32);
+                removed_ids.push(sid);
+                stats.dropped_segments += 1;
+                stats.dropped_rows += (rc - tomb_count).max(0) as i64;
+            }
+        }
+
+        // Decompose path: claim, then decode + restore each segment's rows.
+        if !decompose_ids.is_empty() {
+            // Positional col_idx mapping (same rule as compression /
+            // decompress): non-segment-by physical columns in ordinal order.
+            let mut non_seg_cols: Vec<(u16, String, String)> = Vec::new();
+            let mut col_idx: u16 = 0;
+            for col in &columns {
+                if !col.is_segment_by {
+                    non_seg_cols.push((col_idx, col.name.clone(), col.data_type.clone()));
+                    col_idx += 1;
+                }
+            }
+
+            let mut returning_cols = vec!["_segment_id".to_string()];
+            for col in &columns {
+                if col.is_segment_by {
+                    returning_cols.push(format!("\"{}\"::text", col.name));
+                }
+            }
+            returning_cols.push("_row_count".to_string());
+
+            struct ClaimedSegment {
+                segment_id: i32,
+                segment_by_vals: Vec<Option<String>>,
+                row_count: i32,
+            }
+            let mut claimed: Vec<ClaimedSegment> = Vec::new();
+            {
+                let rows = client
+                    .update(
+                        &format!(
+                            "DELETE FROM {} WHERE _segment_id IN ({}) RETURNING {}",
+                            meta_fqn,
+                            id_list(decompose_ids),
+                            returning_cols.join(", ")
+                        ),
+                        None,
+                        &[],
+                    )
+                    .expect("failed to claim segments for decompose");
+                for row in rows {
+                    let mut ordinal = 1;
+                    let segment_id: i32 = row
+                        .get_datum_by_ordinal(ordinal)
+                        .unwrap()
+                        .value::<i32>()
+                        .unwrap()
+                        .unwrap_or(0);
+                    ordinal += 1;
+                    let mut segment_by_vals: Vec<Option<String>> = Vec::new();
+                    for col in &columns {
+                        if col.is_segment_by {
+                            let val: Option<String> = row
+                                .get_datum_by_ordinal(ordinal)
+                                .unwrap()
+                                .value::<String>()
+                                .unwrap();
+                            segment_by_vals.push(val);
+                            ordinal += 1;
+                        }
+                    }
+                    let row_count: i32 = row
+                        .get_datum_by_ordinal(ordinal)
+                        .unwrap()
+                        .value::<i32>()
+                        .unwrap()
+                        .unwrap_or(0);
+                    claimed.push(ClaimedSegment {
+                        segment_id,
+                        segment_by_vals,
+                        row_count,
+                    });
+                }
+            }
+
+            for seg in &claimed {
+                if seg.row_count > 0 {
+                    stats.restored_rows += restore_segment_rows(
+                        client,
+                        &part_fqn,
+                        &blobs_fqn,
+                        &columns,
+                        &non_seg_cols,
+                        seg.segment_id,
+                        &seg.segment_by_vals,
+                        seg.row_count,
+                        tombstones.get(&seg.segment_id),
+                    );
+                }
+                removed_ids.push(seg.segment_id);
+                stats.decomposed_segments += 1;
+            }
+        }
+
+        if removed_ids.is_empty() {
+            return;
+        }
+
+        // Compressed bytes being removed (planner-side counter only) —
+        // measured before the blob rows are deleted.
+        let removed_bytes: i64 = client
+            .select(
+                &format!(
+                    "SELECT COALESCE(SUM(octet_length(_data)), 0)::bigint FROM {} WHERE _segment_id IN ({})",
+                    blobs_fqn,
+                    id_list(&removed_ids)
+                ),
+                None,
+                &[],
+            )
+            .ok()
+            .and_then(|r| r.first().get_one::<i64>().ok().flatten())
+            .unwrap_or(0);
+
+        // Sidecar rows go with the segment (colstats/blooms/bitmaps for
+        // LIVE segments stay exact — the architecture's invariant). Rows
+        // with negative `_segment_id` (reserved for partition-level
+        // sentinels, PERF #47) are untouched by construction: claimed ids
+        // are positive. Tombstone rows are consumed with their segment
+        // (the restore above skipped them).
+        for fqn in [
+            &colstats_fqn,
+            &blobs_fqn,
+            &blooms_fqn,
+            &text_lengths_fqn,
+            &valbitmap_fqn,
+            &tombstones_fqn,
+        ] {
+            if relation_exists(client, fqn) {
+                client
+                    .update(
+                        &format!(
+                            "DELETE FROM {} WHERE _segment_id IN ({})",
+                            fqn,
+                            id_list(&removed_ids)
+                        ),
+                        None,
+                        &[],
+                    )
+                    .expect("failed to delete segment sidecar rows");
+            }
+        }
+
+        catalog::bump_partition_decompose(
+            client,
+            part_info.id,
+            stats.restored_rows + stats.dropped_rows,
+            removed_bytes,
+        )
+        .expect("failed to update partition counters after decompose");
+
+        // Restored rows are loose rows in the partition heap. The insert
+        // trigger skips its flag UPDATE under DML_BYPASS (active here), so
+        // set `has_loose_rows` explicitly on this client. Only when rows
+        // were actually restored — a pure whole-segment DELETE (drop_ids,
+        // restored_rows == 0) adds no loose rows.
+        if stats.restored_rows > 0 {
+            catalog::set_partition_has_loose_rows(client, part_info.id, true)
+                .expect("failed to set has_loose_rows flag after decompose");
+        }
+    });
+
+    // Let other backends drop cached row-count/plan state for this
+    // partition (mirrors compaction; the flag flip above is what the gates
+    // read, and this invalidation drops their cached flag map).
+    unsafe { pg_sys::CacheInvalidateRelcacheByRelid(partition_oid) };
+
+    stats
+}
+
+/// Resolve a partition OID to `(schema, table)` names, erroring out on
+/// failure (shared by the P2 decompose and P2.5 tombstone write paths).
+fn partition_names_for_oid(partition_oid: pg_sys::Oid) -> (String, String) {
+    unsafe {
+        let name_ptr = pg_sys::get_rel_name(partition_oid);
+        let ns_ptr = pg_sys::get_namespace_name(pg_sys::get_rel_namespace(partition_oid));
+        if name_ptr.is_null() || ns_ptr.is_null() {
+            pgrx::error!(
+                "pg_deltax: cannot resolve partition OID {} for compressed DML",
+                u32::from(partition_oid)
+            );
+        }
+        (
+            std::ffi::CStr::from_ptr(ns_ptr)
+                .to_string_lossy()
+                .into_owned(),
+            std::ffi::CStr::from_ptr(name_ptr)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+/// P2.5 tombstone DELETE, step 1: lock the candidate segments' `_meta` rows
+/// `FOR UPDATE` (ordered, to avoid ABBA between concurrent tombstone
+/// writers) and return the ids still alive. The row locks are held to end
+/// of transaction, so a concurrent decompose/compaction of those segments
+/// blocks until we commit — and then sees our tombstones (its restore
+/// excludes them). Candidates whose meta row is already gone (concurrently
+/// decomposed) are simply absent from the result: their rows are ordinary
+/// heap tuples now and the planned DELETE handles whatever its snapshot
+/// sees — the same "0 rows claimed → skip" rule P2 uses. Returns an empty
+/// vec when the partition is no longer compressed (raced a full decompress).
+pub(crate) fn claim_segments_for_tombstone(
+    partition_oid: pg_sys::Oid,
+    segment_ids: &[i32],
+) -> Vec<i32> {
+    if segment_ids.is_empty() {
+        return Vec::new();
+    }
+    let _bypass = DmlBypassGuard::new();
+    let (_schema, part_table) = partition_names_for_oid(partition_oid);
+    let meta_fqn = format!("\"_deltax_compressed\".\"{}_meta\"", part_table);
+
+    Spi::connect_mut(|client| {
+        if !relation_exists(client, &meta_fqn) {
+            return Vec::new();
+        }
+        let id_list = segment_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Goes through `update` (read_only = false): SELECT ... FOR UPDATE
+        // is not allowed on SPI's read-only path.
+        let rows = client
+            .update(
+                &format!(
+                    "SELECT _segment_id FROM {} WHERE _segment_id IN ({}) ORDER BY _segment_id FOR UPDATE",
+                    meta_fqn, id_list
+                ),
+                None,
+                &[],
+            )
+            .expect("failed to lock segments for tombstone DELETE");
+        let mut survivors = Vec::new();
+        for row in rows {
+            if let Some(sid) = row.get::<i32>(1).ok().flatten() {
+                survivors.push(sid);
+            }
+        }
+        survivors
+    })
+}
+
+/// P2.5 tombstone DELETE, step 2: record the exactly-matching rows as
+/// `(segment_id, row_offset)` tombstones. Ordinary heap inserts in the
+/// user's transaction ⇒ MVCC, rollback and replication are native; readers
+/// see the segment unfiltered until commit and exactly filtered after.
+///
+/// `ON CONFLICT DO NOTHING` deduplicates rows that are already tombstoned
+/// (by us under a previous statement, or by a concurrent committed
+/// transaction — matching READ COMMITTED's "row already deleted → skip");
+/// only rows actually inserted count toward the command tag and the catalog
+/// `row_count` decrement (catalog counts stay exact: they track LIVE rows
+/// stored in segments, which is what `DeltaXCount`'s catalog path serves).
+///
+/// Returns the number of rows logically deleted.
+pub(crate) fn insert_dml_tombstones(
+    partition_oid: pg_sys::Oid,
+    targets: &[(i32, Vec<u32>)],
+) -> i64 {
+    if targets.is_empty() {
+        return 0;
+    }
+    let _bypass = DmlBypassGuard::new();
+    let (schema, part_table) = partition_names_for_oid(partition_oid);
+    let tombstones_fqn = format!("\"_deltax_compressed\".\"{}_tombstones\"", part_table);
+
+    let inserted = Spi::connect_mut(|client| {
+        let Some(part_info) = catalog::get_partition_by_name(client, &schema, &part_table)
+            .expect("failed to query partition")
+        else {
+            return 0i64;
+        };
+        if !part_info.is_compressed {
+            return 0i64;
+        }
+        // Lazy creation for partitions compressed before P2.5 (newer
+        // compressions create it eagerly so the GRANT cascade covers it).
+        if !relation_exists(client, &tombstones_fqn) {
+            client
+                .update(
+                    &format!(
+                        "CREATE TABLE IF NOT EXISTS {} (_segment_id INT NOT NULL, _row_offset INT NOT NULL, PRIMARY KEY (_segment_id, _row_offset))",
+                        tombstones_fqn
+                    ),
+                    None,
+                    &[],
+                )
+                .expect("failed to create tombstones table");
+        }
+
+        let mut inserted: i64 = 0;
+        for (segment_id, offsets) in targets {
+            if offsets.is_empty() {
+                continue;
+            }
+            let offs = offsets
+                .iter()
+                .map(|o| o.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rows = client
+                .update(
+                    &format!(
+                        "INSERT INTO {} (_segment_id, _row_offset)
+                         SELECT {}, o FROM unnest(ARRAY[{}]::int4[]) AS o
+                         ON CONFLICT DO NOTHING
+                         RETURNING 1",
+                        tombstones_fqn, segment_id, offs
+                    ),
+                    None,
+                    &[],
+                )
+                .expect("failed to insert tombstones");
+            inserted += rows.len() as i64;
+        }
+
+        if inserted > 0 {
+            // Catalog row_count tracks live segment rows — keep it exact so
+            // the DeltaXCount catalog shortcut and planner stats stay right.
+            catalog::bump_partition_decompose(client, part_info.id, inserted, 0)
+                .expect("failed to update partition counters after tombstone DELETE");
+            // Flip the P2.5 gate flag in the same transaction (MVCC-atomic
+            // with the tombstone rows): the plan/exec gates read this
+            // instead of probing the _tombstones table.
+            catalog::set_partition_has_tombstones(client, part_info.id, true)
+                .expect("failed to set has_tombstones flag");
+        }
+        inserted
+    });
+
+    if inserted > 0 {
+        // Invalidate cached plans for this partition: plans built before the
+        // first tombstone may carry DeltaXAgg / DeltaXMinMax fast paths that
+        // are gated off while tombstones exist (their exec-time stale guards
+        // would otherwise error). Same mechanism P1 uses for the heap-tail
+        // empty→non-empty transition.
+        unsafe { pg_sys::CacheInvalidateRelcacheByRelid(partition_oid) };
+    }
+    inserted
+}
+
+/// Compact the loose heap rows of a compressed partition into new segments.
+///
+/// Loose rows are INSERTs that arrived after the partition was compressed
+/// (P1 transparent DML). They live in the partition heap and are unioned
+/// with the segment data at scan time; compaction moves them into proper
+/// segments so the metadata-only fast paths re-engage.
+#[pg_extern]
+fn deltax_compact_partition(partition: &str) -> String {
+    Spi::connect_mut(|client| compact_partition_impl(client, partition))
+}
+
+/// RAII guard for the backend-local DML/planner bypass flag. While held,
+/// the set_rel_pathlist / upper-paths hooks plan queries against the plain
+/// heap (no DeltaX custom scans) and the DML rejection (trigger + executor
+/// hook) is disabled. Drop-restore (not drop-reset) so guards NEST safely —
+/// compaction holds one while calling `decompose_segments_for_dml`, which
+/// takes its own — and an error inside compaction can't leave the backend
+/// planning every later query without DeltaX paths.
+struct DmlBypassGuard {
+    prev: bool,
+}
+
+impl DmlBypassGuard {
+    fn new() -> Self {
+        let prev = crate::scan::dml_bypass_active();
+        crate::scan::set_dml_bypass(true);
+        DmlBypassGuard { prev }
+    }
+}
+
+impl Drop for DmlBypassGuard {
+    fn drop(&mut self) {
+        crate::scan::set_dml_bypass(self.prev);
+    }
+}
+
+/// Compat: o PG19 renomeou toda a superfície de replication origin —
+/// `RepOriginId` virou `ReplOriginId`, `InvalidRepOriginId` virou
+/// `InvalidReplOriginId`, e a variável de backend `replorigin_session_origin`
+/// foi para dentro do struct `replorigin_xact_state` (campo `origin`).
+#[cfg(not(feature = "pg19"))]
+type OriginId = pg_sys::RepOriginId;
+#[cfg(feature = "pg19")]
+type OriginId = pg_sys::ReplOriginId;
+
+#[cfg(not(feature = "pg19"))]
+const INVALID_ORIGIN_ID: OriginId = pg_sys::InvalidRepOriginId as OriginId;
+#[cfg(feature = "pg19")]
+const INVALID_ORIGIN_ID: OriginId = pg_sys::InvalidReplOriginId as OriginId;
+
+#[inline]
+unsafe fn session_origin() -> OriginId {
+    #[cfg(not(feature = "pg19"))]
+    unsafe {
+        pg_sys::replorigin_session_origin
+    }
+    #[cfg(feature = "pg19")]
+    unsafe {
+        pg_sys::replorigin_xact_state.origin
+    }
+}
+
+#[inline]
+unsafe fn set_session_origin(id: OriginId) {
+    #[cfg(not(feature = "pg19"))]
+    unsafe {
+        pg_sys::replorigin_session_origin = id;
+    }
+    #[cfg(feature = "pg19")]
+    unsafe {
+        pg_sys::replorigin_xact_state.origin = id;
+    }
+}
+
+/// Backend-local cache of the `deltax_internal` replication-origin id.
+/// An invalid id (0) means "not found" — the guard then no-ops.
+fn internal_origin_id() -> OriginId {
+    thread_local! {
+        static ID: std::cell::Cell<OriginId> =
+            const { std::cell::Cell::new(INVALID_ORIGIN_ID) };
+    }
+    ID.with(|c| {
+        let cached = c.get();
+        if cached != INVALID_ORIGIN_ID {
+            return cached;
+        }
+        // Look up by name at the C level (no SQL-function ACL; the origin is
+        // created in the extension SQL). `missing_ok = true` returns an
+        // invalid id rather than erroring when absent.
+        let id = unsafe { pg_sys::replorigin_by_name(c"deltax_internal".as_ptr(), true) };
+        if id != INVALID_ORIGIN_ID {
+            c.set(id);
+        }
+        id
+    })
+}
+
+/// RAII guard that tags all WAL written in its scope with the
+/// `deltax_internal` replication origin, so logical subscribers created
+/// `WITH (origin = none)` filter these internal maintenance changes
+/// (decompose-on-write's restored-row inserts, compaction's segment folds and
+/// loose-row removal) while still receiving the user's own DML. Subscribers
+/// using the default `origin = any` receive the tagged changes normally, so
+/// tagging is safe for both replication topologies (see COMPRESSED_DML.md §7).
+///
+/// Sets the backend-local session origin directly rather than via
+/// `replorigin_session_setup`: we only need per-record WAL tagging, not the
+/// exclusive progress slot session_setup reserves (which would serialize
+/// concurrent internal writers). Nests safely (save/restore).
+struct InternalOriginGuard {
+    prev: OriginId,
+}
+
+impl InternalOriginGuard {
+    fn new() -> Self {
+        let prev = unsafe { session_origin() };
+        // If the origin is absent, id is Invalid → this is a no-op (records
+        // stay untagged), preserving today's behavior.
+        unsafe { set_session_origin(internal_origin_id()) };
+        InternalOriginGuard { prev }
+    }
+}
+
+impl Drop for InternalOriginGuard {
+    fn drop(&mut self) {
+        unsafe { set_session_origin(self.prev) };
+    }
+}
+
+/// Rewrite a companion `CREATE TABLE` DDL into `CREATE TABLE IF NOT EXISTS`.
+/// Compaction may need to create sidecar tables that the original
+/// compression skipped (e.g. `_blooms` when the GUC was off, `_text_lengths`
+/// when there were no text columns yet).
+pub(crate) fn ddl_if_not_exists(ddl: &str) -> String {
+    ddl.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
+}
+
+/// True when the relation named by `fqn` (a quoted, schema-qualified name)
+/// exists.
+fn relation_exists(client: &SpiClient, fqn: &str) -> bool {
+    client
+        .select("SELECT to_regclass($1) IS NOT NULL", Some(1), &[fqn.into()])
+        .ok()
+        .and_then(|r| r.first().get_one::<bool>().ok().flatten())
+        .unwrap_or(false)
+}
+
+pub(crate) fn compact_partition_impl(client: &mut SpiClient, partition: &str) -> String {
+    let (schema, part_table) = crate::partition::resolve_relation(client, partition);
+    let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
+        .expect("failed to query partition")
+        .unwrap_or_else(|| {
+            pgrx::error!(
+                "pg_deltax: partition {}.{} not found in catalog",
+                schema,
+                part_table
+            )
+        });
+
+    if !part_info.is_compressed {
+        return format!(
+            "Partition {}.{} is not compressed; nothing to compact",
+            schema, part_table
+        );
+    }
+
+    let ht = catalog::get_deltatable_by_id(client, part_info.deltatable_id)
+        .expect("failed to query deltatable")
+        .unwrap();
+
+    let part_fqn = crate::partition::fqn(&schema, &part_table);
+
+    // Everything below reads the partition through plain heap plans (the
+    // custom scans would union the segments back in — double-counting) and
+    // deletes the compacted rows past the DML rejection. The guard resets
+    // the flag on every exit path, including errors.
+    let _bypass = DmlBypassGuard::new();
+    // Compaction is pure internal churn (fold loose rows into fresh segments,
+    // rewrite tombstoned segments, delete/truncate the loose region) — none of
+    // it changes the table's logical content. Tag its WAL so origin=none
+    // logical subscribers ignore it. See COMPRESSED_DML.md §7.
+    let _origin = InternalOriginGuard::new();
+
+    // Serialize against concurrent writers: the read → flush → delete cycle
+    // below requires a stable visible row set. The lock is acquired BEFORE
+    // the row-reading snapshot, so in READ COMMITTED every committed loose
+    // row is visible and TRUNCATE at the end cannot destroy unseen data.
+    client
+        .update(
+            &format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", part_fqn),
+            None,
+            &[],
+        )
+        .expect("failed to lock partition for compaction");
+
+    // Re-read the catalog row now that the lock is held: a concurrent
+    // decompress could have flipped is_compressed between the unlocked
+    // check above and the lock grant — compacting then would treat the
+    // fully-restored heap as "loose rows" and truncate real data. The
+    // re-read also pins compressed_columns for the shape guard below.
+    let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
+        .expect("failed to re-query partition")
+        .unwrap_or_else(|| {
+            pgrx::error!(
+                "pg_deltax: partition {}.{} disappeared from catalog during compaction",
+                schema,
+                part_table
+            )
+        });
+    if !part_info.is_compressed {
+        return format!(
+            "Partition {}.{} is not compressed; nothing to compact",
+            schema, part_table
+        );
+    }
+
+    // P2.5: physically rewrite tombstone-bearing segments. Decompose them
+    // (P2 machinery — the restore skips tombstoned rows and deletes the
+    // segments' tombstone rows), then let the normal compaction below fold
+    // the restored live rows into fresh, pristine segments. Finally restore
+    // the zero-block fast gate by TRUNCATE-ing the now-empty tombstones
+    // table (also clears dead pages left by rolled-back tombstone DML).
+    let tombstones_fqn = format!("\"_deltax_compressed\".\"{}_tombstones\"", part_table);
+    let mut rewritten_segments = 0usize;
+    if relation_exists(client, &tombstones_fqn) {
+        let mut tomb_ids: Vec<i32> = Vec::new();
+        for row in client
+            .select(
+                &format!("SELECT DISTINCT _segment_id FROM {}", tombstones_fqn),
+                None,
+                &[],
+            )
+            .expect("failed to read tombstoned segment ids")
+        {
+            if let Some(sid) = row.get::<i32>(1).ok().flatten() {
+                tomb_ids.push(sid);
+            }
+        }
+        if !tomb_ids.is_empty() {
+            let part_oid: pg_sys::Oid = client
+                .select(
+                    "SELECT to_regclass($1)::oid",
+                    Some(1),
+                    &[part_fqn.as_str().into()],
+                )
+                .ok()
+                .and_then(|r| r.first().get_one::<pg_sys::Oid>().ok().flatten())
+                .unwrap_or(pg_sys::InvalidOid);
+            if part_oid != pg_sys::InvalidOid {
+                let stats = decompose_segments_for_dml(part_oid, &tomb_ids, &[]);
+                rewritten_segments = stats.decomposed_segments;
+            }
+        }
+        let any_left: bool = client
+            .select(
+                &format!("SELECT EXISTS (SELECT 1 FROM {})", tombstones_fqn),
+                Some(1),
+                &[],
+            )
+            .ok()
+            .and_then(|r| r.first().get_one::<bool>().ok().flatten())
+            .unwrap_or(true);
+        if !any_left {
+            client
+                .update(&format!("TRUNCATE {}", tombstones_fqn), None, &[])
+                .expect("failed to truncate tombstones table");
+            // All tombstones folded away — clear the P2.5 gate flag so
+            // MIN/MAX/agg pushdowns re-engage for this partition.
+            catalog::set_partition_has_tombstones(client, part_info.id, false)
+                .expect("failed to clear has_tombstones flag after compaction");
+        }
+    }
+
+    let loose_rows: i64 = client
+        .select(
+            &format!("SELECT count(*) FROM ONLY {}", part_fqn),
+            None,
+            &[],
+        )
+        .expect("failed to count loose rows")
+        .first()
+        .get_one::<i64>()
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    if loose_rows == 0 {
+        // A prior REPEATABLE READ compaction deletes (rather than truncates)
+        // the rows it compacted, and autovacuum is disabled on compressed
+        // partitions — so dead rows would keep the heap at nonzero blocks
+        // forever, pinning every scan on the slower heap-tail path and
+        // re-locking here each worker cycle. With the AEL held and zero
+        // visible rows, truncating away the dead tuples is the same MVCC
+        // tradeoff as the compress-time TRUNCATE.
+        let read_committed =
+            unsafe { pg_sys::XactIsoLevel } < pg_sys::XACT_REPEATABLE_READ as std::ffi::c_int;
+        let heap_bytes: i64 = client
+            .select(
+                &format!("SELECT pg_relation_size('{}'::regclass)", part_fqn),
+                Some(1),
+                &[],
+            )
+            .ok()
+            .and_then(|r| r.first().get_one::<i64>().ok().flatten())
+            .unwrap_or(0);
+        if read_committed && heap_bytes > 0 {
+            client
+                .update(&format!("TRUNCATE ONLY {}", part_fqn), None, &[])
+                .expect("failed to truncate dead loose-row region");
+            crate::scan::invalidate_compressed_cache();
+        }
+        // No visible loose rows remain (dead pages from a rolled-back or
+        // RR-deleted insert don't count) — clear the stale P1 gate flag.
+        catalog::set_partition_has_loose_rows(client, part_info.id, false)
+            .expect("failed to clear has_loose_rows flag");
+        if rewritten_segments > 0 {
+            // Everything in the tombstoned segments was deleted — the
+            // decompose removed them outright and there is nothing to fold
+            // (decompose_segments_for_dml already fired the relcache
+            // invalidation for this partition).
+            return format!(
+                "Partition {}.{}: rewrote {} tombstoned segment(s); no loose rows to compact",
+                schema, part_table, rewritten_segments
+            );
+        }
+        return format!(
+            "Partition {}.{} has no loose rows to compact",
+            schema, part_table
+        );
+    }
+
+    // Schema-drift guard: appending segments assumes the companion layout
+    // (col_idx assignment) still matches the live table shape. Refuse when
+    // the parent's column shape changed since compression — the safe path
+    // is a full decompress + recompress.
+    let cc_now = catalog::snapshot_compressed_columns(
+        client,
+        &ht.schema_name,
+        &ht.table_name,
+        &ht.segment_by,
+    )
+    .expect("failed to snapshot column shape");
+    let cc_now_val: serde_json::Value =
+        serde_json::from_str(&cc_now).unwrap_or(serde_json::Value::Null);
+    let shape_matches =
+        matches!(&part_info.compressed_columns, Some(stored) if *stored == cc_now_val);
+    if !shape_matches {
+        pgrx::error!(
+            "pg_deltax: partition {}.{} has loose rows but its column shape changed since compression; run deltax_decompress_partition() + deltax_compress_partition() instead",
+            schema,
+            part_table
+        );
+    }
+
+    let columns = get_column_metadata(
+        client,
+        &schema,
+        &part_table,
+        &ht.segment_by,
+        &ht.time_column,
+        ht.json_extract.as_ref(),
+    );
+    if columns.is_empty() {
+        pgrx::error!("pg_deltax: no columns found for {}.{}", schema, part_table);
+    }
+    // Synthetic json_extract columns don't exist in the partition heap, so
+    // the loose-row cursor below cannot read them (and the companion layout
+    // expects them). Bail with the supported remedy instead of a raw SQL
+    // error from the cursor.
+    if columns.iter().any(|c| c.extracted.is_some()) {
+        pgrx::error!(
+            "pg_deltax: partition {}.{} uses json_extract; compacting loose rows is not supported — run deltax_decompress_partition() + deltax_compress_partition() instead",
+            schema,
+            part_table
+        );
+    }
+
+    let ddl = build_companion_ddl(&part_table, &columns);
+    if !relation_exists(client, &ddl.meta_fqn) {
+        pgrx::error!(
+            "pg_deltax: companion meta table missing for compressed partition {}.{}",
+            schema,
+            part_table
+        );
+    }
+
+    // New segment ids continue after the existing maximum (sentinel rows in
+    // _blooms use -1 and never appear in _meta). The catalog high-water
+    // mark guards against id REUSE: decompose-on-write (P2) deletes meta
+    // rows — possibly the current maximum — after recording it in
+    // `max_segment_id`. Reusing such an id would poison the shared
+    // blob/decompressed caches and the backend-local colstats cache, which
+    // are keyed by `(companion_oid, segment_id, ...)` and assume ids are
+    // never recycled within a companion table's lifetime.
+    let max_segment_id: i32 = client
+        .select(
+            &format!(
+                "SELECT GREATEST(COALESCE(MAX(_segment_id), 0),
+                        (SELECT COALESCE(max_segment_id, 0)
+                           FROM deltax.deltax_partition WHERE id = {}))
+                 FROM {}",
+                part_info.id, ddl.meta_fqn
+            ),
+            None,
+            &[],
+        )
+        .expect("failed to read max segment id")
+        .first()
+        .get_one::<i32>()
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let mut next_segment_id: i32 = max_segment_id + 1;
+    let first_new_segment_id = next_segment_id;
+
+    let segment_size = ht.segment_size as usize;
+    let kinds: Vec<ColumnKind> = columns
+        .iter()
+        .map(|c| classify_column(&c.data_type, c.is_segment_by))
+        .collect();
+
+    // segment_by and text cols cast to ::text; jsonb stays native for the
+    // `JsonbRaw` read (see the matching SELECT builder in
+    // compress_partition_impl for why).
+    let select_cols = columns
+        .iter()
+        .zip(kinds.iter())
+        .map(|(c, kind)| {
+            if c.is_segment_by || matches!(kind, ColumnKind::Text) {
+                format!("\"{}\"::text", c.name)
+            } else {
+                format!("\"{}\"", c.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let order_clause = if !ht.segment_by.is_empty() {
+        let mut order_parts = Vec::new();
+        for s in &ht.segment_by {
+            order_parts.push(format!("\"{}\"", s));
+        }
+        for o in &ht.order_by {
+            order_parts.push(format!("\"{}\"", o));
+        }
+        format!(" ORDER BY {}", order_parts.join(", "))
+    } else {
+        String::new()
+    };
+
+    let order_col_indices: Vec<usize> = ht
+        .order_by
+        .iter()
+        .filter_map(|name| columns.iter().position(|c| c.name == *name))
+        .collect();
+    let seg_col_indices: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_segment_by)
+        .map(|(i, _)| i)
+        .collect();
+
+    let cursor_sql = format!(
+        "DECLARE compact_cursor CURSOR FOR SELECT {} FROM ONLY {}{}",
+        select_cols, part_fqn, order_clause
+    );
+    client
+        .update(&cursor_sql, None, &[])
+        .expect("failed to declare compaction cursor");
+    let batch_size = segment_size;
+    let fetch_sql = format!("FETCH {} FROM compact_cursor", batch_size);
+
+    let mut typed_cols = init_typed_columns(&columns, &kinds);
+    let mut current_seg_values: Vec<Option<String>> = Vec::new();
+    let mut rows_in_segment: usize = 0;
+    let mut total_compressed_size: i64 = 0;
+    let mut total_rows: i64 = 0;
+    let mut blob_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new();
+    let mut bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)> = Vec::new();
+    let mut colstats_buffer: Vec<ColstatsRow> = Vec::new();
+    let mut text_length_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new();
+    let mut valbitmap_value_buffer: Vec<(u16, i32, SegValueCounts)> = Vec::new();
+    let num_nonseg_cols = columns.iter().filter(|c| !c.is_segment_by).count();
+    // Batch-only HLL — merged into the persisted partition sketches below.
+    let mut batch_hll: Vec<CardinalityEstimator<u64>> = (0..num_nonseg_cols)
+        .map(|_| CardinalityEstimator::<u64>::new())
+        .collect();
+    let mut batch_topvals: TopVals = (0..num_nonseg_cols)
+        .map(|_| std::collections::HashMap::new())
+        .collect();
+
+    loop {
+        let result = client
+            .select(&fetch_sql, None, &[])
+            .expect("failed to fetch from compaction cursor");
+        let fetched = result.len();
+        if fetched == 0 {
+            break;
+        }
+        let tuptable_to_free = unsafe { pg_sys::SPI_tuptable };
+
+        for row in result {
+            if !seg_col_indices.is_empty() {
+                let row_seg_values: Vec<Option<String>> = seg_col_indices
+                    .iter()
+                    .map(|&i| {
+                        row.get_datum_by_ordinal(i + 1)
+                            .unwrap()
+                            .value::<String>()
+                            .unwrap()
+                    })
+                    .collect();
+                if current_seg_values.is_empty() {
+                    current_seg_values = row_seg_values;
+                } else if row_seg_values != current_seg_values {
+                    if rows_in_segment > 0 {
+                        total_compressed_size += flush_with_splitting(
+                            client,
+                            &ddl.meta_fqn,
+                            &ddl.colstats_fqn,
+                            &columns,
+                            &typed_cols,
+                            &current_seg_values,
+                            rows_in_segment,
+                            segment_size,
+                            &mut next_segment_id,
+                            &mut blob_buffer,
+                            &mut bloom_buffer,
+                            &mut colstats_buffer,
+                            &mut text_length_buffer,
+                            &mut valbitmap_value_buffer,
+                            &mut batch_hll,
+                            &mut batch_topvals,
+                        );
+                        typed_cols = init_typed_columns(&columns, &kinds);
+                        rows_in_segment = 0;
+                    }
+                    current_seg_values = row_seg_values;
+                }
+            }
+
+            append_row_to_columns(&row, &columns, &kinds, &mut typed_cols);
+            rows_in_segment += 1;
+            total_rows += 1;
+
+            if rows_in_segment >= segment_size {
+                if seg_col_indices.is_empty() {
+                    sort_typed_columns(&mut typed_cols, &order_col_indices, rows_in_segment);
+                }
+                total_compressed_size += flush_with_splitting(
+                    client,
+                    &ddl.meta_fqn,
+                    &ddl.colstats_fqn,
+                    &columns,
+                    &typed_cols,
+                    &current_seg_values,
+                    rows_in_segment,
+                    segment_size,
+                    &mut next_segment_id,
+                    &mut blob_buffer,
+                    &mut bloom_buffer,
+                    &mut colstats_buffer,
+                    &mut text_length_buffer,
+                    &mut valbitmap_value_buffer,
+                    &mut batch_hll,
+                    &mut batch_topvals,
+                );
+                typed_cols = init_typed_columns(&columns, &kinds);
+                rows_in_segment = 0;
+            }
+        }
+
+        if !tuptable_to_free.is_null() {
+            unsafe { pg_sys::SPI_freetuptable(tuptable_to_free) };
+        }
+        if fetched < batch_size {
+            break;
+        }
+    }
+
+    if rows_in_segment > 0 {
+        if seg_col_indices.is_empty() {
+            sort_typed_columns(&mut typed_cols, &order_col_indices, rows_in_segment);
+        }
+        total_compressed_size += flush_with_splitting(
+            client,
+            &ddl.meta_fqn,
+            &ddl.colstats_fqn,
+            &columns,
+            &typed_cols,
+            &current_seg_values,
+            rows_in_segment,
+            segment_size,
+            &mut next_segment_id,
+            &mut blob_buffer,
+            &mut bloom_buffer,
+            &mut colstats_buffer,
+            &mut text_length_buffer,
+            &mut valbitmap_value_buffer,
+            &mut batch_hll,
+            &mut batch_topvals,
+        );
+    }
+
+    client
+        .update("CLOSE compact_cursor", None, &[])
+        .expect("failed to close compaction cursor");
+
+    if total_rows == 0 {
+        return format!(
+            "Partition {}.{} has no loose rows to compact",
+            schema, part_table
+        );
+    }
+
+    // ---- Append sidecar rows to the TOAST-backed companion tables. ----
+    if !colstats_buffer.is_empty() {
+        colstats_buffer.sort_by_key(|r| (r.col_idx, r.segment_id));
+        for chunk in colstats_buffer.chunks(100) {
+            let values: Vec<String> = chunk
+                .iter()
+                .map(|r| {
+                    let min_str = r.min_val.map_or("NULL".to_string(), |v| v.to_string());
+                    let max_str = r.max_val.map_or("NULL".to_string(), |v| v.to_string());
+                    let sum_str = r.sum_val.as_deref().unwrap_or("NULL");
+                    format!(
+                        "({}, {}, {}, {}, {}, {}, {}, {})",
+                        r.col_idx,
+                        r.segment_id,
+                        min_str,
+                        max_str,
+                        sum_str,
+                        r.nonnull_count,
+                        r.nonzero_count,
+                        r.ndistinct
+                    )
+                })
+                .collect();
+            let sql = format!(
+                "INSERT INTO {} (_col_idx, _segment_id, _min, _max, _sum, _nonnull_count, _nonzero_count, _ndistinct) VALUES {}",
+                ddl.colstats_fqn,
+                values.join(", ")
+            );
+            client
+                .update(&sql, None, &[])
+                .expect("failed to insert compaction colstats");
+        }
+    }
+
+    if !blob_buffer.is_empty() {
+        client
+            .update(&ddl_if_not_exists(&ddl.blobs_ddl), None, &[])
+            .expect("failed to ensure blobs table");
+        blob_buffer.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+        for (col_idx, seg_id, blob) in blob_buffer {
+            use pgrx::datum::DatumWithOid;
+            let insert_sql = format!(
+                "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
+                ddl.blobs_fqn
+            );
+            let args: Vec<DatumWithOid> = vec![
+                (col_idx as i16).into(),
+                seg_id.into(),
+                DatumWithOid::from(blob),
+            ];
+            client
+                .update(&insert_sql, None, &args)
+                .expect("failed to insert compaction blob");
+        }
+    }
+
+    if !bloom_buffer.is_empty() {
+        client
+            .update(&ddl_if_not_exists(&ddl.blooms_ddl), None, &[])
+            .expect("failed to ensure blooms table");
+        bloom_buffer.sort_by_key(|&(col_idx, seg_id, _, _)| (col_idx, seg_id));
+        for (col_idx, seg_id, num_hashes, bloom_bytes) in bloom_buffer {
+            use pgrx::datum::DatumWithOid;
+            let insert_sql = format!(
+                "INSERT INTO {} (_col_idx, _segment_id, _num_hashes, _data) VALUES ($1, $2, $3, $4)",
+                ddl.blooms_fqn
+            );
+            let args: Vec<DatumWithOid> = vec![
+                (col_idx as i16).into(),
+                seg_id.into(),
+                (num_hashes as i16).into(),
+                DatumWithOid::from(bloom_bytes),
+            ];
+            client
+                .update(&insert_sql, None, &args)
+                .expect("failed to insert compaction bloom");
+        }
+    }
+
+    if !text_length_buffer.is_empty() {
+        client
+            .update(&ddl_if_not_exists(&ddl.text_lengths_ddl), None, &[])
+            .expect("failed to ensure text_lengths table");
+        text_length_buffer.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+        for (col_idx, seg_id, blob) in text_length_buffer {
+            use pgrx::datum::DatumWithOid;
+            let insert_sql = format!(
+                "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
+                ddl.text_lengths_fqn
+            );
+            let args: Vec<DatumWithOid> = vec![
+                (col_idx as i16).into(),
+                seg_id.into(),
+                DatumWithOid::from(blob),
+            ];
+            client
+                .update(&insert_sql, None, &args)
+                .expect("failed to insert compaction text length sidecar");
+        }
+    }
+
+    // NOTE for partition-level bloom sentinels (PERF #47, not yet on this
+    // branch): compaction appends segments to a live companion table, so if
+    // `_segment_id = -1` sentinel rows ever exist they MUST be fold-merged
+    // with the batch's value hashes or deleted here — a sentinel that
+    // under-covers any live segment produces wrong query results.
+
+    // ---- Valbitmap: keep every existing column's bitmap regime exact, or
+    // drop it (absence is safe — segments just stop being pruned on that
+    // column). ----
+    let new_segment_ids: Vec<i32> = (first_new_segment_id..next_segment_id).collect();
+    append_valbitmaps_for_compaction(
+        client,
+        part_info.id,
+        &ddl.valbitmap_fqn,
+        &columns,
+        &valbitmap_value_buffer,
+        &new_segment_ids,
+    );
+
+    // ---- Catalog refresh ----
+    catalog::bump_partition_compaction(client, part_info.id, total_rows, total_compressed_size)
+        .expect("failed to bump partition counters");
+
+    // Partition-level [min,max] map (Phase -1 pruning) — recomputed from the
+    // full colstats table, which now includes the new segments. CORRECTNESS-
+    // critical: new values may extend the old ranges.
+    catalog::update_partition_column_minmax(client, part_info.id, &ddl.colstats_fqn, &columns)
+        .expect("failed to refresh partition column_minmax");
+
+    // ndistinct/HLL: merge the batch sketches into the persisted ones
+    // (planner-only; best-effort).
+    merge_batch_hll_into_catalog(client, part_info.id, &columns, &batch_hll);
+
+    // ---- Remove the compacted loose rows. READ COMMITTED: TRUNCATE is safe
+    // (the AEL was taken before the reading snapshot, so the visible set is
+    // complete) and restores the zero-block state that re-enables every
+    // metadata fast path. Under REPEATABLE READ / SERIALIZABLE the reading
+    // snapshot may predate the lock, so DELETE only what we actually read
+    // (rows invisible to the snapshot survive for a later compaction). ----
+    let read_committed =
+        unsafe { pg_sys::XactIsoLevel } < pg_sys::XACT_REPEATABLE_READ as std::ffi::c_int;
+    if read_committed {
+        client
+            .update(&format!("TRUNCATE ONLY {}", part_fqn), None, &[])
+            .expect("failed to truncate compacted loose rows");
+    } else {
+        client
+            .update(&format!("DELETE FROM ONLY {}", part_fqn), None, &[])
+            .expect("failed to delete compacted loose rows");
+    }
+    // Every loose row visible to this compaction is now folded into a
+    // segment; clear the P1 gate flag so plan/exec fast paths re-engage.
+    // (A concurrent inserter's rows aren't visible here and its own commit
+    // re-sets the flag.) MVCC-atomic with the row removal above.
+    catalog::set_partition_has_loose_rows(client, part_info.id, false)
+        .expect("failed to clear has_loose_rows flag after compaction");
+
+    // ANALYZE the touched companion tables and refresh pg_statistic /
+    // reltuples for the partition (best-effort).
+    let _ = client.update(&format!("ANALYZE {}", ddl.meta_fqn), None, &[]);
+    let _ = client.update(&format!("ANALYZE {}", ddl.colstats_fqn), None, &[]);
+    let msg = analyze_partition_impl_split(client, &schema, &part_table);
+    pgrx::debug1!("pg_deltax compact stats refresh: {}", msg);
+
+    // Make the change visible to cached plans in every backend: TRUNCATE
+    // already swaps the relfilenode (relcache inval), but the DELETE path
+    // needs an explicit invalidation; sending it twice is harmless.
+    let part_oid: pg_sys::Oid = client
+        .select(&format!("SELECT '{}'::regclass::oid", part_fqn), None, &[])
+        .ok()
+        .and_then(|r| r.first().get_one::<pg_sys::Oid>().ok().flatten())
+        .unwrap_or(pg_sys::InvalidOid);
+    if part_oid != pg_sys::InvalidOid {
+        unsafe { pg_sys::CacheInvalidateRelcacheByRelid(part_oid) };
+    }
+    crate::scan::invalidate_compressed_cache();
+
+    format!(
+        "Compacted {}.{}: {} loose rows into {} new segment(s)",
+        schema,
+        part_table,
+        total_rows,
+        next_segment_id - first_new_segment_id,
+    )
+}
+
+/// Keep the per-segment value-presence bitmaps exact across a compaction.
+///
+/// For every column present in the catalog `column_valmap`:
+///   - if every new segment produced a complete value set and the union of
+///     old + new values still fits the bitmap budget, append the novel
+///     values to the END of the valmap (existing bitmaps stay valid — the
+///     scan probes positions linearly and missing trailing bits read as 0)
+///     and insert a bitmap row for each new segment;
+///   - otherwise DROP the column's bitmap regime entirely (delete its
+///     valbitmap rows + valmap/valcounts entries). Absence is safe; an
+///     incomplete valmap is not (`prune_all` would wrongly prune segments
+///     containing a new value).
+fn append_valbitmaps_for_compaction(
+    client: &mut SpiClient,
+    partition_id: i32,
+    valbitmap_fqn: &str,
+    columns: &[ColumnMeta],
+    value_buffer: &[(u16, i32, SegValueCounts)],
+    new_segment_ids: &[i32],
+) {
+    use std::collections::HashMap;
+
+    // Load the current valmap / valcounts from the catalog.
+    let (valmap_text, valcounts_text): (Option<String>, Option<String>) = {
+        let row = client
+            .select(
+                "SELECT column_valmap::text, column_valcounts::text
+                   FROM deltax.deltax_partition WHERE id = $1",
+                Some(1),
+                &[partition_id.into()],
+            )
+            .expect("failed to read partition valmap");
+        let first = row.first();
+        (first.get(1).ok().flatten(), first.get(2).ok().flatten())
+    };
+    let mut valmap: HashMap<String, Vec<String>> = valmap_text
+        .as_deref()
+        .and_then(|t| serde_json::from_str(t).ok())
+        .unwrap_or_default();
+    if valmap.is_empty() {
+        // No bitmap regime on any column — nothing to maintain.
+        return;
+    }
+    let mut valcounts: ColumnValcounts = valcounts_text
+        .as_deref()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+        .map(|v| {
+            let mut out: ColumnValcounts = HashMap::new();
+            if let serde_json::Value::Object(cols) = v {
+                for (name, counts) in cols {
+                    if let serde_json::Value::Object(m) = counts {
+                        let list: Vec<(String, i64)> = m
+                            .into_iter()
+                            .filter_map(|(k, c)| c.as_i64().map(|n| (k, n)))
+                            .collect();
+                        out.insert(name, list);
+                    }
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+
+    // col_idx ↔ name mapping (non-segment-by enumeration order).
+    let mut idx_to_name: HashMap<u16, &str> = HashMap::new();
+    let mut name_to_idx: HashMap<&str, u16> = HashMap::new();
+    {
+        let mut ci: u16 = 0;
+        for col in columns {
+            if col.is_segment_by {
+                continue;
+            }
+            idx_to_name.insert(ci, col.name.as_str());
+            name_to_idx.insert(col.name.as_str(), ci);
+            ci += 1;
+        }
+    }
+
+    let mut changed = false;
+    let col_names: Vec<String> = valmap.keys().cloned().collect();
+    for col_name in col_names {
+        let Some(&col_idx) = name_to_idx.get(col_name.as_str()) else {
+            // Column no longer exists in the layout (shouldn't happen — the
+            // shape guard upstream rejects drift). Drop defensively.
+            drop_valbitmap_column(
+                client,
+                valbitmap_fqn,
+                None,
+                &mut valmap,
+                &mut valcounts,
+                &col_name,
+            );
+            changed = true;
+            continue;
+        };
+
+        // Collect this column's per-new-segment value sets.
+        let entries: Vec<&(u16, i32, SegValueCounts)> = value_buffer
+            .iter()
+            .filter(|(ci, _, _)| *ci == col_idx)
+            .collect();
+
+        // Completeness: every new segment must have produced a value set
+        // (compute_segment_valbitmap_values omits segments whose local
+        // distinct count overflowed — their values are unknown).
+        if entries.len() != new_segment_ids.len() {
+            drop_valbitmap_column(
+                client,
+                valbitmap_fqn,
+                Some(col_idx),
+                &mut valmap,
+                &mut valcounts,
+                &col_name,
+            );
+            changed = true;
+            continue;
+        }
+
+        // Union check + novel-value collection.
+        let existing = valmap.get(&col_name).cloned().unwrap_or_default();
+        let existing_set: std::collections::HashSet<&str> =
+            existing.iter().map(|s| s.as_str()).collect();
+        let mut novel: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_, _, vals) in &entries {
+            for (v, _) in vals.iter() {
+                if !existing_set.contains(v.as_str()) {
+                    novel.insert(v.clone());
+                }
+            }
+        }
+        if existing.len() + novel.len() > VALBITMAP_MAX_DISTINCT {
+            drop_valbitmap_column(
+                client,
+                valbitmap_fqn,
+                Some(col_idx),
+                &mut valmap,
+                &mut valcounts,
+                &col_name,
+            );
+            changed = true;
+            continue;
+        }
+
+        // Append novel values (sorted among themselves) to the END of the
+        // valmap — existing bitmaps stay valid.
+        let mut updated = existing.clone();
+        updated.extend(novel.iter().cloned());
+        let bit_idx: HashMap<&str, u8> = updated
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.as_str(), i as u8))
+            .collect();
+
+        // Ensure the bitmap table exists (it might not when the original
+        // compress produced no bitmap rows but the catalog valmap exists —
+        // defensive; normally both exist together).
+        let n_bytes = updated.len().div_ceil(8);
+        for (_, seg_id, vals) in &entries {
+            let mut bits: Vec<u8> = vec![0; n_bytes.max(1)];
+            for (v, _) in vals.iter() {
+                if let Some(&bi) = bit_idx.get(v.as_str()) {
+                    bits[(bi / 8) as usize] |= 1u8 << (bi % 8);
+                }
+            }
+            use pgrx::datum::DatumWithOid;
+            let args: Vec<DatumWithOid> = vec![
+                (col_idx as i16).into(),
+                (*seg_id).into(),
+                DatumWithOid::from(bits),
+            ];
+            client
+                .update(
+                    &format!(
+                        "INSERT INTO {} (_col_idx, _segment_id, _bits) VALUES ($1, $2, $3)",
+                        valbitmap_fqn
+                    ),
+                    None,
+                    &args,
+                )
+                .expect("failed to insert compaction valbitmap row");
+        }
+
+        // Merge counts into valcounts (stats-only).
+        if !novel.is_empty() || !entries.is_empty() {
+            let counts = valcounts.entry(col_name.clone()).or_default();
+            for (_, _, vals) in &entries {
+                for (v, c) in vals.iter() {
+                    if let Some(slot) = counts.iter_mut().find(|(k, _)| k == v) {
+                        slot.1 += *c as i64;
+                    } else {
+                        counts.push((v.clone(), *c as i64));
+                    }
+                }
+            }
+        }
+        if !novel.is_empty() {
+            valmap.insert(col_name.clone(), updated);
+        }
+        changed = true;
+    }
+
+    if changed {
+        catalog::update_partition_column_valmap(client, partition_id, &valmap)
+            .expect("failed to update partition column_valmap");
+        catalog::update_partition_column_valcounts(client, partition_id, &valcounts)
+            .expect("failed to update partition column_valcounts");
+    }
+}
+
+/// Remove one column's bitmap regime: its valbitmap rows (when the col_idx
+/// is known and the table exists) plus the valmap/valcounts entries.
+fn drop_valbitmap_column(
+    client: &mut SpiClient,
+    valbitmap_fqn: &str,
+    col_idx: Option<u16>,
+    valmap: &mut std::collections::HashMap<String, Vec<String>>,
+    valcounts: &mut ColumnValcounts,
+    col_name: &str,
+) {
+    if let Some(ci) = col_idx
+        && relation_exists(client, valbitmap_fqn)
+    {
+        client
+            .update(
+                &format!("DELETE FROM {} WHERE _col_idx = $1", valbitmap_fqn),
+                None,
+                &[(ci as i16).into()],
+            )
+            .expect("failed to delete valbitmap rows");
+    }
+    valmap.remove(col_name);
+    valcounts.remove(col_name);
+}
+
+/// Merge the compaction batch's per-column HLL sketches into the persisted
+/// partition sketches and refresh `column_ndistinct`. Planner-only data —
+/// every failure path silently keeps the (slightly stale) existing values.
+fn merge_batch_hll_into_catalog(
+    client: &mut SpiClient,
+    partition_id: i32,
+    columns: &[ColumnMeta],
+    batch_hll: &[CardinalityEstimator<u64>],
+) {
+    let stored: Option<String> = client
+        .select(
+            "SELECT column_hll::text FROM deltax.deltax_partition WHERE id = $1",
+            Some(1),
+            &[partition_id.into()],
+        )
+        .ok()
+        .and_then(|r| r.first().get_one::<String>().ok().flatten());
+    let Some(stored) = stored else { return };
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&stored)
+    else {
+        return;
+    };
+
+    let nd_col_names: Vec<&str> = columns
+        .iter()
+        .filter(|c| !c.is_segment_by)
+        .map(|c| c.name.as_str())
+        .collect();
+
+    let mut merged: std::collections::HashMap<String, CardinalityEstimator<u64>> =
+        std::collections::HashMap::new();
+    for (name, val) in map {
+        if let Ok(sketch) = serde_json::from_value::<CardinalityEstimator<u64>>(val) {
+            merged.insert(name, sketch);
+        }
+    }
+    let mut nd_updates: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for (name, sketch) in nd_col_names.iter().zip(batch_hll.iter()) {
+        if let Some(existing) = merged.get_mut(*name) {
+            existing.merge(sketch);
+            nd_updates.insert((*name).to_string(), existing.estimate() as i64);
+        }
+    }
+    if nd_updates.is_empty() {
+        return;
+    }
+
+    // Refresh column_ndistinct: existing values for untouched columns,
+    // merged estimates for the rest.
+    let existing_nd: std::collections::HashMap<String, i64> = client
+        .select(
+            "SELECT column_ndistinct::text FROM deltax.deltax_partition WHERE id = $1",
+            Some(1),
+            &[partition_id.into()],
+        )
+        .ok()
+        .and_then(|r| r.first().get_one::<String>().ok().flatten())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let mut nd_final = existing_nd;
+    for (k, v) in nd_updates {
+        nd_final.insert(k, v);
+    }
+    let _ = catalog::update_partition_column_ndistinct_from_map(client, partition_id, &nd_final);
+
+    // Re-serialize the merged sketches.
+    let names: Vec<&str> = merged.keys().map(|s| s.as_str()).collect();
+    let sketches: Vec<CardinalityEstimator<u64>> = names
+        .iter()
+        .map(|n| merged.get(*n).cloned().unwrap())
+        .collect();
+    if let Some(json) = serialize_partition_hll(&names, &sketches) {
+        let _ = catalog::update_partition_column_hll(client, partition_id, &json);
+    }
+}
+
+/// Worker entry point: compact every compressed partition of `ht` whose heap
+/// has accumulated loose rows. Returns the number of partitions compacted.
+/// Each partition runs inside a subtransaction (`PgTryBuilder`) so a lock
+/// timeout or transient failure on one partition doesn't abort the worker's
+/// whole maintenance cycle.
+pub fn auto_compact_partitions(client: &mut SpiClient<'_>, ht: &catalog::DeltatableInfo) -> i32 {
+    // json_extract deltatables can't be compacted (synthetic columns have no
+    // heap presence — compact_partition_impl rejects them); skip instead of
+    // error-logging every worker cycle.
+    if ht.json_extract.is_some() && crate::get_json_extract_mode() != crate::JsonExtractMode::None {
+        return 0;
+    }
+
+    // Candidates: loose heap rows (P1 INSERTs / P2 decomposed rows) OR a
+    // non-empty `_tombstones` companion (P2.5 — compaction physically
+    // rewrites tombstoned segments and TRUNCATEs the table back to the
+    // zero-block steady state).
+    let candidates = client
+        .select(
+            "SELECT p.schema_name, p.table_name
+               FROM deltax.deltax_partition p
+              WHERE p.deltatable_id = $1
+                AND p.is_compressed
+                AND (COALESCE(
+                        pg_catalog.pg_relation_size(
+                            pg_catalog.to_regclass(
+                                pg_catalog.format('%I.%I', p.schema_name, p.table_name))),
+                        0) > 0
+                  OR COALESCE(
+                        pg_catalog.pg_relation_size(
+                            pg_catalog.to_regclass(
+                                pg_catalog.format('_deltax_compressed.%I',
+                                                  p.table_name || '_tombstones'))),
+                        0) > 0)",
+            None,
+            &[ht.id.into()],
+        )
+        .expect("failed to query compaction candidates");
+
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for row in candidates {
+        let sch: Option<String> = row.get(1).ok().flatten();
+        let name: Option<String> = row.get(2).ok().flatten();
+        if let (Some(sch), Some(name)) = (sch, name) {
+            targets.push((sch, name));
+        }
+    }
+    if targets.is_empty() {
+        return 0;
+    }
+
+    // Don't let the AccessExclusive lock stall the worker behind long
+    // queries; skip locked partitions until the next cycle.
+    let _ = client.update("SET LOCAL lock_timeout = '5s'", None, &[]);
+
+    let mut compacted = 0;
+    for (sch, name) in &targets {
+        let qualified = format!("{}.{}", sch, name);
+        // `&mut SpiClient` is not UnwindSafe; PgTryBuilder runs the closure
+        // in a subtransaction and rolls it back on error, which is exactly
+        // the recovery the SPI stack needs — assert the boundary.
+        let client_cell = std::panic::AssertUnwindSafe(&mut *client);
+        let ok = pgrx::PgTryBuilder::new(move || {
+            let client_cell = client_cell;
+            let msg = compact_partition_impl(client_cell.0, &qualified);
+            pgrx::log!("pg_deltax: {}", msg);
+            true
+        })
+        .catch_others(|_e| {
+            pgrx::log!(
+                "pg_deltax: compaction of a partition was skipped (lock timeout or error); will retry next cycle"
+            );
+            false
+        })
+        .execute();
+        if ok {
+            compacted += 1;
+        }
+    }
+
+    let _ = client.update("SET LOCAL lock_timeout = 0", None, &[]);
+
+    compacted
+}
+
 /// Re-populate pg_class.reltuples + pg_statistic for an already-compressed
 /// partition. `stats::analyze_partition_from_catalog` reads the
 /// authoritative per-column distinct counts persisted at compression time
@@ -4606,54 +6917,181 @@ pub(crate) fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> Stri
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
 mod tests {
     use super::*;
 
-    #[test]
-    fn check_compressible_type_accepts_typed_and_text_io_types() {
-        for ty in [
-            "smallint",
-            "integer",
-            "bigint",
-            "real",
-            "double precision",
-            "boolean",
-            "date",
-            "timestamp without time zone",
-            "timestamp with time zone",
-            "jsonb",
-            "text",
-            "character varying",
-            "character",
-            "numeric",
-            "numeric(18,8)",
-            "uuid",
-            "inet",
-            "bytea",
-        ] {
-            assert!(
-                check_compressible_type(ty).is_ok(),
-                "expected {} to be compressible",
-                ty
-            );
-        }
+    /// End-to-end P2 decompose-on-write inside the pgrx harness (this also
+    /// runs against PG 18 via `make test PG_MAJOR=18`, covering the
+    /// version-gated ExecutorRun hook): an UPDATE on a compressed partition
+    /// decomposes only the candidate segment; an unqualified DELETE drops
+    /// the remaining segments directly.
+    #[pg_test]
+    fn test_decompose_on_write_update_delete() {
+        Spi::run("SET pg_deltax.mock_now = '2025-01-15 12:00:00+00'").unwrap();
+        Spi::run("CREATE TABLE dml_e2e (ts timestamptz NOT NULL, device text NOT NULL, val int)")
+            .unwrap();
+        Spi::get_one::<String>(
+            "SELECT deltax.deltax_create_table('dml_e2e', 'ts', '1 day'::interval)",
+        )
+        .unwrap();
+        Spi::get_one::<String>(
+            "SELECT deltax.deltax_enable_compression('dml_e2e', \
+             segment_by => ARRAY['device'], order_by => ARRAY['ts'])",
+        )
+        .unwrap();
+        // 3 devices x 50 points; disjoint val ranges per device so equality
+        // quals are colstats-prunable to a single segment.
+        Spi::run(
+            "INSERT INTO dml_e2e \
+             SELECT '2025-01-15'::timestamptz + (p || ' minutes')::interval, \
+                    'dev-' || d, d * 1000 + p \
+             FROM generate_series(0, 2) d, generate_series(0, 49) p",
+        )
+        .unwrap();
+
+        let part: String = Spi::get_one(
+            "SELECT partition_name FROM deltax.deltax_partition_info('dml_e2e') \
+             WHERE range_start <= '2025-01-15'::timestamptz \
+               AND range_end > '2025-01-15'::timestamptz",
+        )
+        .unwrap()
+        .unwrap();
+        let result: String = Spi::get_one(&format!(
+            "SELECT deltax.deltax_compress_partition('{part}')"
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(result.contains("Compressed"), "compress failed: {result}");
+
+        let part_table = part.rsplit('.').next().unwrap();
+        let meta = format!("_deltax_compressed.\"{part_table}_meta\"");
+        let seg_count = || -> i64 {
+            Spi::get_one(&format!(
+                "SELECT count(*) FROM {meta} WHERE _segment_id > 0"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(seg_count(), 3, "expected one segment per device");
+
+        // Targeted UPDATE: val = 1010 lives only in dev-1's segment.
+        Spi::run("UPDATE dml_e2e SET val = -1 WHERE val = 1010").unwrap();
+        assert_eq!(seg_count(), 2, "exactly one segment decomposed");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_e2e"),
+            Ok(Some(150)),
+            "row count unchanged by UPDATE"
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_e2e WHERE val = -1"),
+            Ok(Some(1)),
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_e2e WHERE val = 1010"),
+            Ok(Some(0)),
+        );
+        // Sidecars went with the decomposed segment.
+        assert_eq!(
+            Spi::get_one::<i64>(&format!(
+                "SELECT count(DISTINCT _segment_id) \
+                 FROM _deltax_compressed.\"{part_table}_colstats\" WHERE _segment_id > 0"
+            )),
+            Ok(Some(2)),
+        );
+
+        // Unqualified DELETE drops the remaining segments + heap rows.
+        Spi::run("DELETE FROM dml_e2e").unwrap();
+        assert_eq!(seg_count(), 0);
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_e2e"),
+            Ok(Some(0)),
+        );
     }
 
-    #[test]
-    fn check_compressible_type_refuses_what_it_cannot_rebuild() {
-        // ARRAY is what information_schema reports for any array column;
-        // money and interval have GUC-dependent text output; ranges and
-        // user-defined types have no codec at all.
-        for ty in ["int4range", "ARRAY", "money", "interval", "USER-DEFINED"] {
-            let err =
-                check_compressible_type(ty).expect_err(&format!("expected {} to be refused", ty));
-            assert!(
-                err.contains(ty),
-                "the refusal has to name the type; got: {}",
-                err
-            );
-        }
+    /// jsonb columns store binary jsonb varlena payloads in segment blobs
+    /// (not UTF-8 text). Restoring rows to the heap — decompose-on-write for
+    /// UPDATE and full deltax_decompress_partition() — must go through the
+    /// byte-safe decode + jsonb_out path, not the text codec (which would
+    /// panic with "invalid UTF-8 in LZ4 data").
+    #[pg_test]
+    fn test_decompose_and_decompress_roundtrip_jsonb() {
+        Spi::run("SET pg_deltax.mock_now = '2025-01-15 12:00:00+00'").unwrap();
+        Spi::run("CREATE TABLE dml_jsonb (ts timestamptz NOT NULL, val int, payload jsonb)")
+            .unwrap();
+        Spi::get_one::<String>(
+            "SELECT deltax.deltax_create_table('dml_jsonb', 'ts', '1 day'::interval)",
+        )
+        .unwrap();
+        Spi::get_one::<String>(
+            "SELECT deltax.deltax_enable_compression('dml_jsonb', \
+             segment_by => ARRAY[]::text[], order_by => ARRAY['ts'])",
+        )
+        .unwrap();
+        // Distinct payloads per row defeat dictionary encoding so the blob
+        // takes the Lz4Blocked path; a NULL exercises the null bitmap.
+        Spi::run(
+            "INSERT INTO dml_jsonb \
+             SELECT '2025-01-15'::timestamptz + (p || ' minutes')::interval, p, \
+                    CASE WHEN p = 7 THEN NULL \
+                         ELSE jsonb_build_object('k', p, 'tag', 'v-' || p) END \
+             FROM generate_series(0, 49) p",
+        )
+        .unwrap();
+
+        let part: String = Spi::get_one(
+            "SELECT partition_name FROM deltax.deltax_partition_info('dml_jsonb') \
+             WHERE range_start <= '2025-01-15'::timestamptz \
+               AND range_end > '2025-01-15'::timestamptz",
+        )
+        .unwrap()
+        .unwrap();
+        let result: String = Spi::get_one(&format!(
+            "SELECT deltax.deltax_compress_partition('{part}')"
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(result.contains("Compressed"), "compress failed: {result}");
+
+        // UPDATE decomposes the segment; the restored heap rows must carry
+        // the original jsonb payloads.
+        Spi::run("UPDATE dml_jsonb SET val = -1 WHERE val = 10").unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_jsonb"),
+            Ok(Some(50)),
+        );
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT payload->>'tag' FROM dml_jsonb WHERE payload->>'k' = '10'"
+            ),
+            Ok(Some("v-10".to_string())),
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_jsonb WHERE payload IS NULL"),
+            Ok(Some(1)),
+        );
+
+        // Compact (folds the decomposed heap rows back into segments — this
+        // exercises the post-INSERT jsonb compression path too), then full
+        // decompress: the same restore path, all rows.
+        Spi::get_one::<String>(&format!("SELECT deltax.deltax_compact_partition('{part}')"))
+            .unwrap();
+        Spi::get_one::<String>(&format!(
+            "SELECT deltax.deltax_decompress_partition('{part}')"
+        ))
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM dml_jsonb"),
+            Ok(Some(50)),
+        );
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT count(*) FROM dml_jsonb \
+                 WHERE payload IS NOT NULL AND payload->>'tag' = 'v-' || (payload->>'k')"
+            ),
+            Ok(Some(49)),
+        );
     }
 
     #[test]
@@ -5150,8 +7588,22 @@ mod tests {
         ));
         assert!(matches!(classify_column("date", false), ColumnKind::Date));
         assert!(matches!(classify_column("jsonb", false), ColumnKind::Jsonb));
+        assert!(matches!(
+            classify_column("time without time zone", false),
+            ColumnKind::Time
+        ));
+        assert!(matches!(classify_column("uuid", false), ColumnKind::Uuid));
+        assert!(matches!(classify_column("bytea", false), ColumnKind::Bytea));
+        assert!(matches!(classify_column("inet", false), ColumnKind::Inet));
+        assert!(matches!(classify_column("cidr", false), ColumnKind::Inet));
         // Unknown types default to Text (no error — caller doesn't see this).
-        assert!(matches!(classify_column("uuid", false), ColumnKind::Text));
+        assert!(matches!(
+            classify_column("interval", false),
+            ColumnKind::Text
+        ));
+        assert!(matches!(classify_column("timetz", false), ColumnKind::Text));
+        // segment_by columns are always read as text for SQL literals.
+        assert!(matches!(classify_column("uuid", true), ColumnKind::Text));
     }
 
     #[test]

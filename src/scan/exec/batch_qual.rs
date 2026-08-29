@@ -23,7 +23,7 @@ pub(super) enum LikeStrategy {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct BatchQual {
+pub(in crate::scan) struct BatchQual {
     pub(super) col_idx: usize,                      // 0-based column index
     pub(super) op: BatchCompareOp,                  // comparison operator
     pub(super) const_datum: pg_sys::Datum,          // constant value

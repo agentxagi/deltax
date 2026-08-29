@@ -235,6 +235,100 @@ unsafe fn current_agg_worker_slot() -> usize {
     }
 }
 
+/// Lower bound on the GROUP BY cardinality for the count-floor two-pass
+/// top-N gate: catalog HLL ndistinct of the most distinct single group
+/// column, summed across the scanned partitions. The group count is >=
+/// any one (bijective) key component's ndistinct. Planner estimates
+/// won't do here — `plan_rows` is clamped to the input-row estimate,
+/// which runs ~3x low. Cheap: the planner already populated the
+/// per-backend ndistinct cache for this query's partitions.
+fn compute_group_nd_hint(
+    group_specs: &[GroupByColSpec],
+    meta: &crate::scan::exec::segments::MetadataInfo,
+    companion_oids: &[pg_sys::Oid],
+    topn_limit: i64,
+    where_quals: *mut pg_sys::List,
+) -> usize {
+    if topn_limit <= 0 || !where_quals.is_null() {
+        return 0;
+    }
+    group_specs
+        .iter()
+        .filter(|gs| {
+            matches!(gs.expr, GroupByExpr::Column | GroupByExpr::AddConst { .. })
+                && (gs.col_idx as usize) < meta.col_names.len()
+        })
+        .map(|gs| {
+            let col_name = &meta.col_names[gs.col_idx as usize];
+            companion_oids
+                .iter()
+                .map(|&oid| {
+                    crate::scan::cost::get_column_ndistinct(oid)
+                        .get(col_name)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(0) as usize
+                })
+                .sum()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Upper bound on the GROUP BY cardinality from catalog HLL ndistinct:
+/// the product of per-column distinct counts over the DISTINCT columns the
+/// group keys reference, saturating. Every supported `GroupByExpr` is a
+/// function of a single column, so the joint cardinality of any number of
+/// keys derived from one column is bounded by that column's ndistinct
+/// (bijections like `col - 1` preserve it, date_trunc/CASE reduce it).
+/// Per-partition counts are summed, which over-counts values shared across
+/// partitions — fine for an upper bound.
+///
+/// Returns `usize::MAX` (no cap) when any referenced column lacks a
+/// catalog count.
+///
+/// Why this exists: the planner's own group estimate degrades to "clamp at
+/// input rows" when expressions defeat its statistics (ClickBench Q35
+/// groups by `ClientIP, ClientIP-1, ClientIP-2, ClientIP-3` → estimate =
+/// full table row count), and `plan_rows` then oversizes every worker's
+/// pre-allocated group map. The catalog knows ClientIP has ~10M distinct
+/// values; use it.
+fn compute_group_nd_cap(
+    group_specs: &[GroupByColSpec],
+    meta: &crate::scan::exec::segments::MetadataInfo,
+    companion_oids: &[pg_sys::Oid],
+) -> usize {
+    let mut cols: Vec<usize> = group_specs
+        .iter()
+        .map(|gs| gs.col_idx as usize)
+        .filter(|&ci| ci < meta.col_names.len())
+        .collect();
+    if cols.len() != group_specs.len() {
+        return usize::MAX;
+    }
+    cols.sort_unstable();
+    cols.dedup();
+    let mut cap: usize = 1;
+    for ci in cols {
+        let col_name = &meta.col_names[ci];
+        let nd: usize = companion_oids
+            .iter()
+            .map(|&oid| {
+                crate::scan::cost::get_column_ndistinct(oid)
+                    .get(col_name)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as usize
+            })
+            .sum();
+        if nd == 0 {
+            return usize::MAX;
+        }
+        cap = cap.saturating_mul(nd);
+    }
+    cap.max(1)
+}
+
 /// Static CustomExecMethods struct for DeltaXAgg.
 pub(crate) static DELTAX_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
@@ -283,6 +377,40 @@ pub(crate) unsafe extern "C-unwind" fn create_agg_scan_state(
     }
 }
 
+/// P1/P2.5 stale-plan guard. The planner never emits a DeltaXAgg path when
+/// any involved compressed partition holds loose heap rows (transparent
+/// INSERTs) or tombstones — DeltaXAgg's columnar accumulators cannot ingest
+/// row-form heap tuples and its metadata fast paths count physical rows, so
+/// either would silently corrupt the aggregate. This guard catches a cached
+/// plan re-executed after such a change: the writer flips the
+/// `has_loose_rows` / `has_tombstones` catalog flag and fires a relcache
+/// invalidation; command-start invalidation processing both replans the
+/// cached plan and drops this backend's flag map, so re-reading the flag
+/// here sees the new state and errors (a retry replans onto the slow path).
+///
+/// Reads the catalog flags rather than physically probing every partition
+/// heap + `_tombstones` table (which forced a cold relcache build per
+/// partition on every agg query — the dominant fresh-backend cost): the
+/// flags are MVCC-atomic with the rows and refreshed at command start, so
+/// they are as current as a physical probe would be here (see
+/// `hook::DML_FLAGS`).
+fn error_if_compressed_heap_tail(companion_oids: &[pg_sys::Oid]) {
+    for &oid in companion_oids {
+        // Flag lookups keyed by companion OID (the flag map holds both keys)
+        // — no partition-OID resolution needed.
+        if crate::scan::hook::companion_has_loose_rows_flag(oid) {
+            pgrx::error!(
+                "pg_deltax: a compressed partition gained uncompressed rows after this plan was created; retry the query"
+            );
+        }
+        if crate::scan::hook::companion_has_tombstones_flag(oid) {
+            pgrx::error!(
+                "pg_deltax: a compressed partition gained tombstoned rows after this plan was created; retry the query"
+            );
+        }
+    }
+}
+
 /// BeginCustomScan callback for DeltaXAgg: decompress and aggregate.
 #[pg_guard]
 pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
@@ -320,6 +448,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
             if plan.companion_oids.is_empty() {
                 pgrx::error!("pg_deltax: DeltaXAgg has no companion tables");
             }
+            error_if_compressed_heap_tail(&plan.companion_oids);
             reset_scan_buf_stats();
             let ctx = build_agg_exec_context_from_plan(plan);
             let state = build_deferred_agg_state(ctx, /* is_worker */ false);
@@ -343,6 +472,8 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
         if plan.companion_oids.is_empty() {
             pgrx::error!("pg_deltax: DeltaXAgg has no companion tables");
         }
+
+        error_if_compressed_heap_tail(&plan.companion_oids);
 
         let (meta, metadata_us) = load_agg_metadata_from_plan(&plan.companion_oids);
 
@@ -727,6 +858,13 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
         // Load segments from all companion tables (with lazy pruning)
         let n_workers = crate::get_parallel_workers();
         let use_lazy = n_workers > 1;
+        // Planner group-count estimate for this agg, capped by the catalog
+        // HLL ndistinct bound. `plan_rows` degrades to the full input row
+        // count when grouping expressions defeat PG's statistics (see
+        // `compute_group_nd_cap`), and it only pre-sizes worker hash maps —
+        // an over-estimate directly costs allocation and zeroing time.
+        let est_groups = ((*(*node).ss.ps.plan).plan_rows.max(0.0) as usize)
+            .min(compute_group_nd_cap(&group_specs, &meta, &companion_oids));
         let lazy_cols: Vec<bool> = needed_cols_main.clone();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_detoast_us: u64 = 0;
@@ -838,6 +976,13 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
             &meta.col_types,
             &batch_quals,
         ) {
+            let nd_hint = compute_group_nd_hint(
+                &group_specs,
+                &meta,
+                &companion_oids,
+                topn_limit,
+                where_quals,
+            );
             let state = dispatch_parallel_compact_path(
                 agg_specs,
                 group_specs,
@@ -856,6 +1001,8 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 time_min,
                 time_max,
                 n_workers,
+                est_groups,
+                nd_hint,
                 use_lazy,
                 num_result_cols,
                 metadata_us,
@@ -943,6 +1090,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                     rust_regex_infos.push(RustRegexInfo {
                         regex: compiled,
                         replacement: rust_replacement,
+                        simple: super::regex::SimplePattern::try_parse(pattern, replacement),
                         col_idx: gs.col_idx as usize,
                     });
                 }
@@ -993,6 +1141,13 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
             );
 
         if can_parallel_mixed_flag {
+            let nd_hint = compute_group_nd_hint(
+                &group_specs,
+                &meta,
+                &companion_oids,
+                topn_limit,
+                where_quals,
+            );
             let state = dispatch_parallel_mixed_path(
                 agg_specs,
                 group_specs,
@@ -1013,6 +1168,8 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 time_min,
                 time_max,
                 n_workers,
+                est_groups,
+                nd_hint,
                 use_lazy,
                 num_result_cols,
                 metadata_us,
@@ -1207,6 +1364,7 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 group_specs: &ctx.group_specs,
                 col_names: &ctx.meta.col_names,
                 col_types: &ctx.meta.col_types,
+                time_column: &ctx.meta.time_column,
                 segment_by: &ctx.meta.segment_by,
                 blob_idx: &ctx.meta.blob_idx,
                 missing_values: &ctx.meta.missing_values,
@@ -1216,6 +1374,7 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 time_min: ctx.time_min,
                 time_max: ctx.time_max,
                 topn_spec: ctx.topn_spec,
+                reserve_groups: 0,
             };
 
             const CHUNK: u64 = 4;
@@ -1228,7 +1387,8 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 }
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
-                let chunk_result = process_segments_compact(slice, &cfg);
+                let seq = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg);
                 merge_compact_results(
                     &mut global.compact_map,
                     &mut global.compact_storage,
@@ -1426,6 +1586,7 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 group_specs: &ctx.group_specs,
                 col_names: &ctx.meta.col_names,
                 col_types: &ctx.meta.col_types,
+                time_column: &ctx.meta.time_column,
                 segment_by: &ctx.meta.segment_by,
                 blob_idx: &ctx.meta.blob_idx,
                 missing_values: &ctx.meta.missing_values,
@@ -1435,6 +1596,7 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 time_min: ctx.time_min,
                 time_max: ctx.time_max,
                 topn_spec: None,
+                reserve_groups: 0,
             };
             const CHUNK: u64 = 4;
             loop {
@@ -1446,7 +1608,8 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 }
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
-                let chunk_result = process_segments_compact(slice, &cfg);
+                let seq = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg);
                 merge_compact_results(
                     &mut local.compact_map,
                     &mut local.compact_storage,
@@ -1536,6 +1699,7 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 group_specs: &ctx.group_specs,
                 col_names: &ctx.meta.col_names,
                 col_types: &ctx.meta.col_types,
+                time_column: &ctx.meta.time_column,
                 segment_by: &ctx.meta.segment_by,
                 blob_idx: &ctx.meta.blob_idx,
                 missing_values: &ctx.meta.missing_values,
@@ -1545,6 +1709,7 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 time_min: ctx.time_min,
                 time_max: ctx.time_max,
                 topn_spec: ctx.topn_spec,
+                reserve_groups: 0,
             };
 
             loop {
@@ -1554,7 +1719,8 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 }
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
-                let chunk_result = process_segments_compact(slice, &cfg);
+                let seq = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg);
 
                 merge_compact_results(
                     &mut local.compact_map,

@@ -2972,6 +2972,17 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
             &buf.partition_table,
         )
         .expect("failed to install compressed partition DML trigger");
+        // P2.5: eager (empty) tombstones companion — see compress.rs step 9.
+        {
+            let ddl = crate::compress::build_companion_ddl(&buf.partition_table, columns);
+            client
+                .update(
+                    &crate::compress::ddl_if_not_exists(&ddl.tombstones_ddl),
+                    None,
+                    &[],
+                )
+                .expect("failed to create tombstones table");
+        }
         // Per-column distinct counts: prefer the value-based HLL estimate
         // (one sketch per non-segment column, unioned across segments). The
         // colstats-derived fallback merges per-segment `_ndistinct` by a

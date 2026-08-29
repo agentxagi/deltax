@@ -208,7 +208,8 @@ def replicated_pair(pg_container):
 
 
 def _setup_publication_and_subscription(
-    repl, *, publish="insert, update, delete, truncate", replica_identity=None
+    repl, *, publish="insert, update, delete, truncate", replica_identity=None,
+    origin=None,
 ):
     """Create matching tables on both sides, then wire pub→sub.
 
@@ -216,6 +217,13 @@ def _setup_publication_and_subscription(
     passes `publish='insert, update, delete'` to suppress TRUNCATE — the
     compression flow truncates the partition heap and we don't want that
     truncation to follow the wire.
+
+    `origin='none'` creates the subscription WITH (origin = none), which
+    filters out changes carrying a replication origin — i.e. pg_deltax's
+    internal decompose/compaction churn (tagged with the `deltax_internal`
+    origin) — while still applying the user's own origin-less DML. This is
+    the Scenario-1 recipe: hold the user table on the subscriber and
+    (de)compress independently.
     """
     pub_db = repl["pub_db"]
     sub_db = repl["sub_db"]
@@ -252,13 +260,14 @@ def _setup_publication_and_subscription(
     # Subscription. copy_data=false so we start from an empty snapshot —
     # we want to observe the WAL stream, not the initial table copy.
     # create_slot=false because we already made the slot above.
+    origin_opt = f", origin = {origin}" if origin else ""
     with _db_conn(sub_db, autocommit=True) as sub:
         sub.execute(
             f"CREATE SUBSCRIPTION {repl['sub_name']} "
             f"CONNECTION '{repl['conn_str']}' "
             f"PUBLICATION {repl['pub_name']} "
             f"WITH (copy_data = false, slot_name = '{repl['pub_slot']}', "
-            f"      create_slot = false)"
+            f"      create_slot = false{origin_opt})"
         )
 
 
@@ -407,6 +416,142 @@ def test_compression_with_truncate_excluded_preserves_subscriber(replicated_pair
 
     with _db_conn(repl["sub_db"]) as sub:
         _wait_for_row_count(sub, "metrics", 201)
+
+
+def test_decompose_dml_on_compressed_replicates_without_duplication(replicated_pair):
+    """Scenario 1 + `origin = none`: DML on a compressed partition (which
+    internally decomposes a whole segment back to loose heap rows) must NOT
+    duplicate rows on the subscriber, while the user's own UPDATE/DELETE
+    still replicates.
+
+    pg_deltax tags the decompose/compaction WAL with the `deltax_internal`
+    replication origin; the origin=none subscription filters exactly those
+    internal changes. Without it, the decompose's whole-segment re-INSERT
+    would land on the subscriber as duplicate rows.
+    """
+    repl = replicated_pair
+    # Scenario 1: hold the user table on the subscriber, exclude TRUNCATE
+    # (publisher-side compression), FULL identity for UPDATE/DELETE, and
+    # origin=none to drop the internal decompose/compaction churn.
+    _setup_publication_and_subscription(
+        repl, publish="insert, update, delete", replica_identity="FULL", origin="none"
+    )
+
+    # 200 rows across 5 devices, all in the BASE_TS partition.
+    with _db_conn(repl["pub_db"]) as pub:
+        pub.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        pub.execute(
+            f"INSERT INTO metrics (ts, device_id, temperature) "
+            f"SELECT '{BASE_TS}'::timestamptz + (g * interval '1 minute'), "
+            f"       'device-' || MOD(g, 5)::text, 20.0 + g * 0.1 "
+            f"FROM generate_series(0, 199) g"
+        )
+    with _db_conn(repl["sub_db"]) as sub:
+        _wait_for_row_count(sub, "metrics", 200)
+
+    # Compress on the publisher (segment_by device → one segment per device).
+    with _db_conn(repl["pub_db"]) as pub:
+        pub.execute(
+            "SELECT deltax.deltax_enable_compression('metrics', "
+            "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        (part,) = pub.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
+            f"WHERE range_start <= '{BASE_TS}'::timestamptz "
+            f"  AND range_end   >  '{BASE_TS}'::timestamptz"
+        ).fetchone()
+        pub.execute(f"SELECT deltax.deltax_compress_partition('{part}')")
+        assert pub.execute("SELECT count(*) FROM metrics").fetchone()[0] == 200
+
+    # UPDATE on the compressed partition → decompose device-1's segment (40
+    # rows) into the heap, then apply the UPDATE. The decompose re-INSERTs are
+    # origin-tagged (filtered); only the UPDATE should reach the subscriber.
+    with _db_conn(repl["pub_db"]) as pub:
+        n = pub.execute(
+            "UPDATE metrics SET temperature = 99.9 WHERE device_id = 'device-1'"
+        ).rowcount
+        assert n == 40
+
+    # The subscriber must still have exactly 200 rows (no duplicated segment)
+    # and device-1's rows must reflect the UPDATE.
+    time.sleep(2)
+    with _db_conn(repl["sub_db"]) as sub:
+        total = sub.execute("SELECT count(*) FROM metrics").fetchone()[0]
+        assert total == 200, (
+            f"subscriber has {total} rows (expected 200) — decompose re-inserts "
+            "leaked past the origin=none filter"
+        )
+        updated = sub.execute(
+            "SELECT count(*) FROM metrics WHERE device_id = 'device-1' "
+            "AND temperature = 99.9"
+        ).fetchone()[0]
+        assert updated == 40, f"user UPDATE did not replicate ({updated}/40 rows)"
+
+    # Compaction (folds device-1's loose rows back into a fresh segment) is
+    # also pure internal churn — the subscriber's logical view is unchanged.
+    with _db_conn(repl["pub_db"]) as pub:
+        pub.execute(f"SELECT deltax.deltax_compact_partition('{part}')")
+    time.sleep(2)
+    with _db_conn(repl["sub_db"]) as sub:
+        assert sub.execute("SELECT count(*) FROM metrics").fetchone()[0] == 200
+        assert sub.execute(
+            "SELECT count(*) FROM metrics WHERE temperature = 99.9"
+        ).fetchone()[0] == 40
+
+
+def test_replicable_deletes_guc_propagates_delete_on_compressed(replicated_pair):
+    """With `pg_deltax.replicable_deletes = on`, a DELETE on a compressed
+    partition replicates to a Scenario-1 subscriber.
+
+    By default a DELETE on compressed data uses the tombstone / whole-segment
+    -drop fast path, which touches only companion tables — excluded from a
+    Scenario-1 publication — so the subscriber would keep the row. The GUC
+    forces decompose-on-write, turning the delete into an ordinary heap DELETE
+    that replicates like any row delete (the decompose re-inserts are
+    origin-tagged and filtered by origin=none).
+    """
+    repl = replicated_pair
+    _setup_publication_and_subscription(
+        repl, publish="insert, update, delete", replica_identity="FULL", origin="none"
+    )
+
+    with _db_conn(repl["pub_db"]) as pub:
+        pub.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        pub.execute(
+            f"INSERT INTO metrics (ts, device_id, temperature) "
+            f"SELECT '{BASE_TS}'::timestamptz + (g * interval '1 minute'), "
+            f"       'device-' || MOD(g, 5)::text, 20.0 + g * 0.1 "
+            f"FROM generate_series(0, 199) g"
+        )
+    with _db_conn(repl["sub_db"]) as sub:
+        _wait_for_row_count(sub, "metrics", 200)
+
+    with _db_conn(repl["pub_db"]) as pub:
+        pub.execute(
+            "SELECT deltax.deltax_enable_compression('metrics', "
+            "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        (part,) = pub.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
+            f"WHERE range_start <= '{BASE_TS}'::timestamptz "
+            f"  AND range_end   >  '{BASE_TS}'::timestamptz"
+        ).fetchone()
+        pub.execute(f"SELECT deltax.deltax_compress_partition('{part}')")
+
+    # DELETE device-2's 40 rows on the compressed partition, with the GUC on
+    # so it decomposes rather than tombstoning.
+    with _db_conn(repl["pub_db"]) as pub:
+        pub.execute("SET pg_deltax.replicable_deletes = on")
+        n = pub.execute("DELETE FROM metrics WHERE device_id = 'device-2'").rowcount
+        assert n == 40
+        assert pub.execute("SELECT count(*) FROM metrics").fetchone()[0] == 160
+
+    # The delete must reach the subscriber: 200 - 40 = 160, and no device-2.
+    with _db_conn(repl["sub_db"]) as sub:
+        _wait_for_row_count(sub, "metrics", 160)
+        assert sub.execute(
+            "SELECT count(*) FROM metrics WHERE device_id = 'device-2'"
+        ).fetchone()[0] == 0
 
 
 def test_partition_attached_after_publication_auto_publishes(replicated_pair):

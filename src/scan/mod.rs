@@ -22,6 +22,11 @@ static PREV_UPPER_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 /// Previous hook to chain (ExecutorStart_hook).
 static PREV_EXECUTOR_START_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
+/// Previous hook to chain (ExecutorRun_hook). Used by the whole-segment
+/// DELETE fast path to fold directly-dropped segment row counts into
+/// `es_processed` (command tag correctness).
+static PREV_EXECUTOR_RUN_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
 /// Previous hook to chain (get_relation_info_hook).
 static PREV_GET_RELATION_INFO_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -61,6 +66,22 @@ pub(crate) fn set_dml_bypass(bypass: bool) {
     hook::set_dml_bypass(bypass);
 }
 
+/// Read the backend-local DML bypass flag (used by the compressed-partition
+/// trigger via `deltax.deltax_dml_bypass_active()`).
+pub(crate) fn dml_bypass_active() -> bool {
+    hook::dml_bypass_active()
+}
+
+/// True if the relation's main fork has zero blocks (no loose heap rows
+/// possible). Conservative in the non-empty direction: deleted-but-not-
+/// vacuumed rows keep their blocks.
+///
+/// # Safety
+/// Must be called with a valid transaction (opens the relation).
+pub(crate) unsafe fn relation_heap_is_empty(oid: pg_sys::Oid) -> bool {
+    unsafe { hook::relation_heap_is_empty(oid) }
+}
+
 /// Look up the companion OID for a compressed partition's relation OID,
 /// or `InvalidOid` if it's not a pg_deltax-managed compressed table.
 ///
@@ -89,19 +110,33 @@ pub unsafe fn register_hook() {
         }
         pg_sys::create_upper_paths_hook = Some(hook::deltax_create_upper_paths);
 
-        // Register get_relation_info_hook so we can patch `rel->tuples`
-        // and `rel->pages` for compressed partitions. PG's default
+        // Register the planner hook that patches `rel->tuples` and
+        // `rel->pages` for compressed partitions. PG's default
         // `estimate_rel_size` multiplies reltuples by curpages/relpages,
         // and curpages on a compressed partition is 0 (the heap is
         // truncated), so reltuples=50K collapses to tuples=0 and every
         // restrictinfo selectivity multiplies out to 0/1. Setting
         // rel->tuples here (before set_baserel_size_estimates runs)
         // feeds the correct baseline into the planner.
-        let prev_gri = pg_sys::get_relation_info_hook;
-        if let Some(prev_fn) = prev_gri {
-            PREV_GET_RELATION_INFO_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
+        //
+        // PG19 trocou get_relation_info_hook por build_simple_rel_hook
+        // (upstream 91f33a2ae). Mesma janela, mesma finalidade.
+        #[cfg(not(feature = "pg19"))]
+        {
+            let prev_gri = pg_sys::get_relation_info_hook;
+            if let Some(prev_fn) = prev_gri {
+                PREV_GET_RELATION_INFO_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
+            }
+            pg_sys::get_relation_info_hook = Some(hook::deltax_get_relation_info);
         }
-        pg_sys::get_relation_info_hook = Some(hook::deltax_get_relation_info);
+        #[cfg(feature = "pg19")]
+        {
+            let prev_bsr = pg_sys::build_simple_rel_hook;
+            if let Some(prev_fn) = prev_bsr {
+                PREV_GET_RELATION_INFO_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
+            }
+            pg_sys::build_simple_rel_hook = Some(hook::deltax_build_simple_rel);
+        }
 
         // Register planner_hook so we can post-process the final plan tree
         // and rewrite JSONB-extract chains in upper plans (json_extract feature).
@@ -117,7 +152,9 @@ pub unsafe fn register_hook() {
     }
 }
 
-/// Register the ExecutorStart hook to block DML on compressed partitions.
+/// Register the ExecutorStart hook for transparent DML on compressed
+/// partitions: P1 lets INSERT through (loose rows), P2 decomposes candidate
+/// segments before UPDATE/DELETE/MERGE, and ON CONFLICT stays rejected.
 ///
 /// # Safety
 /// Must be called from `_PG_init()`. Replaces the global ExecutorStart hook pointer.
@@ -128,5 +165,19 @@ pub unsafe fn register_executor_start_hook() {
             PREV_EXECUTOR_START_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
         }
         pg_sys::ExecutorStart_hook = Some(hook::deltax_executor_start);
+    }
+}
+
+/// Register the ExecutorRun hook (whole-segment DELETE command-tag fixup).
+///
+/// # Safety
+/// Must be called from `_PG_init()`. Replaces the global ExecutorRun hook pointer.
+pub unsafe fn register_executor_run_hook() {
+    unsafe {
+        let prev = pg_sys::ExecutorRun_hook;
+        if let Some(prev_fn) = prev {
+            PREV_EXECUTOR_RUN_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
+        }
+        pg_sys::ExecutorRun_hook = Some(hook::deltax_executor_run);
     }
 }

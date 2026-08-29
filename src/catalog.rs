@@ -395,13 +395,103 @@ pub fn mark_partition_compressed(
     client.update(
         "UPDATE deltax.deltax_partition
          SET is_compressed = true, compressed_size = $1, raw_size = $2,
-             row_count = $3, compressed_at = now()
+             row_count = $3, compressed_at = now(),
+             has_loose_rows = false, has_tombstones = false
          WHERE id = $4",
         None,
         &[
             compressed_size.into(),
             raw_size.into(),
             row_count.into(),
+            partition_id.into(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Add a compaction batch's row count and compressed size to a partition's
+/// counters. Unlike `mark_partition_compressed` (full rebuild) this is
+/// incremental — used when loose heap rows are folded into new segments.
+pub fn bump_partition_compaction(
+    client: &mut SpiClient,
+    partition_id: i32,
+    added_rows: i64,
+    added_compressed_size: i64,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_partition
+         SET row_count = COALESCE(row_count, 0) + $1,
+             compressed_size = COALESCE(compressed_size, 0) + $2,
+             compressed_at = now()
+         WHERE id = $3",
+        None,
+        &[
+            added_rows.into(),
+            added_compressed_size.into(),
+            partition_id.into(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Subtract a decompose batch's row count and compressed size from a
+/// partition's counters (P2 decompose-on-write: segments turned back into
+/// loose heap rows by an UPDATE/DELETE). The inverse of
+/// `bump_partition_compaction`; floors at 0 so a racing estimate can never
+/// drive the counters negative. These counters feed planner cost estimates
+/// only — exactness per segment lives in the companion tables.
+/// Set the P2.5 `has_tombstones` DML gate flag. Called in the same
+/// transaction as the tombstone insert so any snapshot that sees the
+/// tombstone rows sees the flag (see `hook::DML_FLAGS`). Idempotent; only
+/// the false→true transition matters for the relcache invalidation the
+/// caller fires.
+pub fn set_partition_has_tombstones(
+    client: &mut SpiClient,
+    partition_id: i32,
+    value: bool,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_partition SET has_tombstones = $1
+         WHERE id = $2 AND has_tombstones <> $1",
+        None,
+        &[value.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
+/// Set the P1 `has_loose_rows` DML gate flag. Used by compaction to clear
+/// the flag once loose rows are folded into segments and the heap region is
+/// truncated (the INSERT trigger sets it to true; see
+/// `deltax_note_compressed_insert`).
+pub fn set_partition_has_loose_rows(
+    client: &mut SpiClient,
+    partition_id: i32,
+    value: bool,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_partition SET has_loose_rows = $1
+         WHERE id = $2 AND has_loose_rows <> $1",
+        None,
+        &[value.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
+pub fn bump_partition_decompose(
+    client: &mut SpiClient,
+    partition_id: i32,
+    removed_rows: i64,
+    removed_compressed_size: i64,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_partition
+         SET row_count = GREATEST(COALESCE(row_count, 0) - $1, 0),
+             compressed_size = GREATEST(COALESCE(compressed_size, 0) - $2, 0)
+         WHERE id = $3",
+        None,
+        &[
+            removed_rows.into(),
+            removed_compressed_size.into(),
             partition_id.into(),
         ],
     )?;
@@ -845,6 +935,7 @@ pub fn compressed_companion_tables(
                      OR c.relname = p.table_name || '_blooms'
                      OR c.relname = p.table_name || '_text_lengths'
                      OR c.relname = p.table_name || '_valbitmap'
+                     OR c.relname = p.table_name || '_tombstones'
                  )
            )",
         None,
@@ -1008,7 +1099,7 @@ pub fn mark_partition_decompressed(
     client.update(
         "UPDATE deltax.deltax_partition
          SET is_compressed = false, compressed_size = NULL, raw_size = NULL,
-             row_count = NULL, compressed_at = NULL
+             row_count = NULL, compressed_at = NULL, max_segment_id = NULL
          WHERE id = $1",
         None,
         &[partition_id.into()],
@@ -1016,11 +1107,128 @@ pub fn mark_partition_decompressed(
     Ok(())
 }
 
+thread_local! {
+    /// Partitions whose `has_loose_rows` catalog flag this transaction has
+    /// already ensured. Cleared at (sub)transaction end so an aborted
+    /// (sub)transaction — whose catalog UPDATE rolled back with it — re-runs
+    /// the idempotent UPDATE on the next insert. This is what makes the flag
+    /// transition robust where the old `nblocks == 0` detector was not: a
+    /// rolled-back first insert leaves dead heap pages, and a later committed
+    /// insert would have skipped the "empty → non-empty" branch entirely.
+    static LOOSE_FLAG_MEMO: std::cell::RefCell<std::collections::HashSet<pg_sys::Oid>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+    static LOOSE_FLAG_CB_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn loose_flag_xact_callback(
+    _event: pg_sys::XactEvent::Type,
+    _arg: *mut std::ffi::c_void,
+) {
+    // Clear on every transaction end (commit or abort): commit makes the
+    // flag durable so the memo is no longer needed; abort rolled the UPDATE
+    // back so the memo must not suppress a re-run.
+    LOOSE_FLAG_MEMO.with(|m| m.borrow_mut().clear());
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn loose_flag_subxact_callback(
+    event: pg_sys::SubXactEvent::Type,
+    _my_subid: pg_sys::SubTransactionId,
+    _parent_subid: pg_sys::SubTransactionId,
+    _arg: *mut std::ffi::c_void,
+) {
+    // A subtransaction abort rolls back any UPDATE it ran; conservatively
+    // forget everything so the outer transaction's next insert re-runs it.
+    if event == pg_sys::SubXactEvent::SUBXACT_EVENT_ABORT_SUB {
+        LOOSE_FLAG_MEMO.with(|m| m.borrow_mut().clear());
+    }
+}
+
+fn ensure_loose_flag_callbacks() {
+    LOOSE_FLAG_CB_REGISTERED.with(|c| {
+        if !c.get() {
+            unsafe {
+                pg_sys::RegisterXactCallback(Some(loose_flag_xact_callback), std::ptr::null_mut());
+                pg_sys::RegisterSubXactCallback(
+                    Some(loose_flag_subxact_callback),
+                    std::ptr::null_mut(),
+                );
+            }
+            c.set(true);
+        }
+    });
+}
+
+/// Per-row helper for the compressed-partition DML trigger's INSERT branch.
+///
+/// Ensures the partition's `has_loose_rows` catalog flag is set in the same
+/// transaction as the insert — the flag is what every planner/executor gate
+/// consults instead of physically probing the heap (see the gate readers in
+/// `scan/hook.rs`), and MVCC makes it exact: any snapshot that can see the
+/// loose rows sees the flag. On the false → true transition this also sends
+/// a relcache invalidation for the partition, so cached plans in *all*
+/// backends that were built assuming an empty heap (metadata-only aggregate
+/// pushdowns, pathkey-claiming sorted scans, Top-N pushdowns) are replanned,
+/// and other backends' gate-flag caches are dropped.
+///
+/// Cost: one idempotent catalog UPDATE per (transaction, partition) — the
+/// per-row calls after the first hit a thread-local memo. Concurrent first
+/// inserters into the same still-flagged-false partition serialize briefly
+/// on the catalog row lock; once the flag is committed true the UPDATE's
+/// WHERE clause stops matching and later transactions take no lock at all.
+#[pg_extern]
+fn deltax_note_compressed_insert(relid: pg_sys::Oid) -> bool {
+    // Internal maintenance (decompose / compaction) inserts restored rows
+    // under DML_BYPASS while already inside its own SPI transaction; nesting
+    // an SPI UPDATE here is both unnecessary and risky. Those paths set the
+    // `has_loose_rows` flag explicitly on their own SpiClient instead.
+    if crate::scan::dml_bypass_active() {
+        return true;
+    }
+    if LOOSE_FLAG_MEMO.with(|m| m.borrow().contains(&relid)) {
+        return true;
+    }
+    ensure_loose_flag_callbacks();
+    let updated = Spi::connect_mut(|client| {
+        client
+            .update(
+                "UPDATE deltax.deltax_partition p
+                 SET has_loose_rows = true
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE c.oid = $1
+                   AND p.schema_name = n.nspname
+                   AND p.table_name = c.relname
+                   AND NOT p.has_loose_rows",
+                None,
+                &[relid.into()],
+            )
+            .map(|r| r.len())
+            .unwrap_or(0)
+    });
+    if updated > 0 {
+        unsafe { pg_sys::CacheInvalidateRelcacheByRelid(relid) };
+    }
+    LOOSE_FLAG_MEMO.with(|m| m.borrow_mut().insert(relid));
+    true
+}
+
+/// SQL-visible probe for the backend-local DML bypass flag, used by the
+/// compressed-partition trigger to let internal maintenance DML (compaction's
+/// delete of just-compacted loose rows) through while still rejecting user
+/// UPDATE/DELETE.
+#[pg_extern]
+fn deltax_dml_bypass_active() -> bool {
+    crate::scan::dml_bypass_active()
+}
+
 /// Install the DML rejection trigger on a compressed leaf partition.
 ///
 /// Parent-table INSERTs are routed to the leaf after ExecutorStart, so the
 /// result-relation hook cannot reliably catch them. A row trigger on the leaf
-/// fires after tuple routing and blocks both direct and routed DML.
+/// fires after tuple routing; since P1 it lets INSERTs through (loose rows)
+/// and blocks UPDATE/DELETE.
 pub fn install_compressed_dml_trigger(
     client: &mut SpiClient,
     schema: &str,

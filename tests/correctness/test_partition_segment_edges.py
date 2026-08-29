@@ -249,28 +249,80 @@ def test_partition_parent_only_has_no_rows(partition_segment_edges, db):
 
 
 @pytest.mark.parametrize(
-    "statement",
+    ("operation", "statement"),
     (
-        "UPDATE {partition} SET val = 999 WHERE id = 1",
-        "DELETE FROM {partition} WHERE id = 1",
+        ("update", "UPDATE {partition} SET val = 999 WHERE id = 1"),
+        ("delete", "DELETE FROM {partition} WHERE id = 1"),
     ),
     ids=("update", "delete"),
 )
-def test_partition_edge_compressed_partition_rejects_dml(partition_segment_edges, db, statement):
-    _, deltax_table = partition_segment_edges
+def test_partition_edge_compressed_partition_applies_dml(
+    partition_segment_edges,
+    db,
+    operation,
+    statement,
+):
+    # P2 transparent DML: UPDATE/DELETE targeted directly at a compressed
+    # partition succeeds. Row id=1 lives in the compressed 2025-01-14
+    # partition; apply the same statement to the plain twin (the predicate
+    # selects the same single row there) and require read parity.
+    plain_table, deltax_table = partition_segment_edges
     partition_name = db.execute(
         f"""
         SELECT partition_name
         FROM deltax.deltax_partition_info('{deltax_table}')
         WHERE is_compressed
-        ORDER BY partition_name
-        LIMIT 1
+          AND range_start <= '2025-01-14 00:00:00.000001+00'
+          AND range_end > '2025-01-14 00:00:00.000001+00'
         """
     ).fetchone()[0]
 
-    with pytest.raises(Exception, match="cannot .* compressed partition"):
-        db.execute(statement.format(partition=partition_name))
-    db.rollback()
+    deltax_rowcount = db.execute(statement.format(partition=partition_name)).rowcount
+    plain_rowcount = db.execute(statement.format(partition=plain_table)).rowcount
+    assert deltax_rowcount == plain_rowcount == 1
+    db.commit()
+
+    if operation == "update":
+        # The changed value must be visible through the deltax read path.
+        assert db.execute(
+            f"SELECT val FROM {deltax_table} WHERE id = 1"
+        ).fetchone()[0] == 999
+    else:
+        # The row must be gone from both tables, and the partition must keep
+        # its compressed segments — the remaining rows are read back through
+        # the tombstone-aware compressed path below.
+        assert db.execute(
+            f"SELECT count(*) FROM {deltax_table} WHERE id = 1"
+        ).fetchone()[0] == 0
+        assert db.execute(
+            f"SELECT count(*) FROM {plain_table} WHERE id = 1"
+        ).fetchone()[0] == 0
+        still_compressed = db.execute(
+            f"""
+            SELECT is_compressed
+            FROM deltax.deltax_partition_info('{deltax_table}')
+            WHERE partition_name = '{partition_name}'
+            """
+        ).fetchone()[0]
+        assert still_compressed
+
+    deltax_total = db.execute(f"SELECT count(*) FROM {deltax_table}").fetchone()[0]
+    plain_total = db.execute(f"SELECT count(*) FROM {plain_table}").fetchone()[0]
+    assert deltax_total == plain_total
+
+    assert_query_case(
+        db,
+        QueryCase(
+            f"post_{operation}_all_rows_ordered",
+            """
+            SELECT id, ts, device_id, bucket, val, metric, payload
+            FROM {table}
+            ORDER BY ts, id
+            """,
+        ),
+        plain_table=plain_table,
+        deltax_table=deltax_table,
+    )
 
 
 def test_partition_edges_match_plain_in_non_utc_session_timezone(partition_segment_edges, db):

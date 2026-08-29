@@ -1,6 +1,6 @@
 [package]
 name = "pg_deltax"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 resolver = "3"
 license = "Apache-2.0"
@@ -9,18 +9,21 @@ description = "PostgreSQL time-series extension with Gorilla compression"
 [lib]
 crate-type = ["cdylib", "lib"]
 
-[[bin]]
-name = "pgrx_embed_pg_deltax"
-path = "src/bin/pgrx_embed.rs"
-
 [features]
 default = ["pg17"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
-pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18", "pg18_plus"]
+pg19 = ["pgrx/pg19", "pgrx-tests/pg19", "pg18_plus"]
+# "PG18 ou mais novo", não "exatamente o PG18". Cobre o TupleDesc com
+# CompactAttribute, o parâmetro novo de index_beginscan, pk_cmptype em vez de
+# pk_strategy e o ExecutorRun sem execute_once — tudo introduzido no PG18 e
+# mantido no PG19. Sem isto, compilar com `--features pg19` desliga 13 blocos
+# `cfg` e o crate não fecha.
+pg18_plus = []
 pg_test = []
 
 [dependencies]
-pgrx = "0.17"
+pgrx = "=0.19.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 lz4_flex = "0.11"
@@ -34,7 +37,7 @@ parquet = { version = "55", default-features = false, features = ["zstd", "snap"
 glob = "0.3"
 
 [dev-dependencies]
-pgrx-tests = "0.17"
+pgrx-tests = "=0.19.2"
 pg_deltax_test_stubs = { path = "test-stubs" }
 
 [profile.dev]

@@ -275,7 +275,6 @@ def test_direct_backfill_null_segment_by_regression(db):
     )
 
 
-@pytest.mark.xfail(strict=True, reason="numeric fallback columns currently decode with invalid numeric text")
 def test_numeric_fallback_type_regression(db):
     db.execute("SET pg_deltax.mock_now = '2025-01-20 12:00:00+00'")
     for table_name in ("numeric_fallback_plain", "numeric_fallback"):
@@ -333,7 +332,6 @@ def test_numeric_fallback_type_regression(db):
     )
 
 
-@pytest.mark.xfail(strict=True, reason="time fallback columns currently decode to invalid time values")
 def test_time_fallback_type_regression(db):
     db.execute("SET pg_deltax.mock_now = '2025-01-20 12:00:00+00'")
     for table_name in ("time_fallback_plain", "time_fallback"):
@@ -385,7 +383,6 @@ def test_time_fallback_type_regression(db):
     )
 
 
-@pytest.mark.xfail(strict=True, reason="uuid fallback columns currently decode from raw text bytes")
 def test_uuid_fallback_type_regression(db):
     db.execute("SET pg_deltax.mock_now = '2025-01-20 12:00:00+00'")
     for table_name in ("uuid_fallback_plain", "uuid_fallback"):
@@ -437,7 +434,6 @@ def test_uuid_fallback_type_regression(db):
     )
 
 
-@pytest.mark.xfail(strict=True, reason="bytea fallback columns currently decode escaped text bytes")
 def test_bytea_fallback_type_regression(db):
     db.execute("SET pg_deltax.mock_now = '2025-01-20 12:00:00+00'")
     for table_name in ("bytea_fallback_plain", "bytea_fallback"):

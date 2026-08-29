@@ -2667,11 +2667,14 @@ class TestMinMaxPushdown:
 
 
 # ---------------------------------------------------------------------------
-# DML blocking on compressed partitions
+# DML on compressed partitions
 # ---------------------------------------------------------------------------
 
 class TestDMLBlocking:
-    """Verify that INSERT/UPDATE/DELETE on compressed partitions raise errors."""
+    """Verify DML semantics on compressed partitions: INSERT succeeds
+    transparently (P1 heap-tail); UPDATE/DELETE succeed via P2
+    decompose-on-write (see tests/test_compressed_dml.py for the full
+    suite)."""
 
     def _setup_and_compress(self, db):
         """Create table, insert data, compress a partition. Return partition name."""
@@ -2696,30 +2699,49 @@ class TestDMLBlocking:
         db.commit()
         return part_name
 
-    def test_insert_blocked_on_compressed(self, db):
-        """INSERT into a compressed partition raises an error."""
+    def test_insert_into_compressed_lands_in_heap_tail(self, db):
+        """INSERT into a compressed partition succeeds (P1 transparent
+        INSERT): the row lands in the partition heap and is immediately
+        visible through the decompress union."""
         part_name = self._setup_and_compress(db)
-        with pytest.raises(Exception, match="cannot INSERT into compressed partition"):
-            db.execute(
-                f"INSERT INTO \"{part_name}\" (ts, device_id, temperature, pressure, status) "
-                f"VALUES ('2025-01-15 06:00:00+00', 'dev-new', 99.0, 1000.0, true)"
-            )
+        db.execute(
+            f"INSERT INTO \"{part_name}\" (ts, device_id, temperature, pressure, status) "
+            f"VALUES ('2025-01-15 06:00:00+00', 'dev-new', 99.0, 1000.0, true)"
+        )
+        db.commit()
+        count = db.execute(
+            f"SELECT count(*) FROM \"{part_name}\" WHERE device_id = 'dev-new'"
+        ).fetchone()[0]
+        assert count == 1
+        # The loose row physically sits in the partition heap.
+        loose_bytes = db.execute(
+            f"SELECT pg_relation_size('{part_name}')"
+        ).fetchone()[0]
+        assert loose_bytes > 0
 
-    def test_update_blocked_on_compressed(self, db):
-        """UPDATE on a compressed partition raises an error."""
+    def test_update_on_compressed_decomposes(self, db):
+        """UPDATE on a compressed partition succeeds (P2 decompose-on-write)
+        and the new values are visible through the union scan."""
         part_name = self._setup_and_compress(db)
-        with pytest.raises(Exception, match="cannot UPDATE compressed partition"):
-            db.execute(
-                f"UPDATE \"{part_name}\" SET temperature = 0.0"
-            )
+        before = db.execute(f'SELECT count(*) FROM "{part_name}"').fetchone()[0]
+        cur = db.execute(f'UPDATE "{part_name}" SET temperature = 0.0')
+        assert cur.rowcount == before
+        db.commit()
+        zeroed = db.execute(
+            f'SELECT count(*) FROM "{part_name}" WHERE temperature = 0.0'
+        ).fetchone()[0]
+        assert zeroed == before
 
-    def test_delete_blocked_on_compressed(self, db):
-        """DELETE from a compressed partition raises an error."""
+    def test_delete_on_compressed(self, db):
+        """DELETE from a compressed partition succeeds (P2): the unqualified
+        DELETE removes every row and reports the logical row count."""
         part_name = self._setup_and_compress(db)
-        with pytest.raises(Exception, match="cannot DELETE from compressed partition"):
-            db.execute(
-                f"DELETE FROM \"{part_name}\""
-            )
+        before = db.execute(f'SELECT count(*) FROM "{part_name}"').fetchone()[0]
+        assert before > 0
+        cur = db.execute(f'DELETE FROM "{part_name}"')
+        assert cur.rowcount == before
+        db.commit()
+        assert db.execute(f'SELECT count(*) FROM "{part_name}"').fetchone()[0] == 0
 
     def test_dml_works_after_decompress(self, db):
         """After decompression, DML works again."""
@@ -4542,3 +4564,374 @@ class TestCompressAllPartitions:
         assert results == [], (
             f"expected zero eligible partitions, got {results}"
         )
+
+
+class TestJsonbCompressionFidelity:
+    """The post-INSERT compression path reads jsonb back via SPI. It must store
+    the jsonb container verbatim — NOT round-trip through serde_json, which
+    would silently round numbers outside i64/u64/f64 range.
+
+    Comparisons use server-side `::text` (jsonb_out is full-precision) rather
+    than letting psycopg parse jsonb into Python floats, which would itself lose
+    precision and mask a regression.
+    """
+
+    def _setup(self, db, table="jfidelity"):
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute(f"""
+            CREATE TABLE {table} (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                data JSONB
+            )
+        """)
+        db.execute(
+            f"SELECT deltax.deltax_create_table('{table}', 'ts', '1 day'::interval)"
+        )
+        db.commit()
+
+    def test_high_precision_numbers_survive_compression(self, db):
+        table = "jfidelity"
+        self._setup(db, table)
+
+        # Values chosen to break a serde_json (no arbitrary_precision) round-trip:
+        # - a 29-significant-digit decimal (f64 keeps ~17)
+        # - a 30-digit integer, well beyond u64::MAX (~1.8e19)
+        # - a plain nested object as a control
+        payloads = [
+            '{"amount": 0.12345678901234567890123456789}',
+            '{"big": 123456789012345678901234567890}',
+            '{"nested": {"k": 1, "arr": [1, 2, 3]}, "s": "hello"}',
+        ]
+        for i, p in enumerate(payloads):
+            db.execute(
+                f"INSERT INTO {table} VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i}', '{p}'::jsonb)"
+            )
+        db.commit()
+
+        # Canonical, full-precision text straight from PG, before compression.
+        before = db.execute(
+            f"SELECT data::text FROM {table} ORDER BY ts"
+        ).fetchall()
+        assert len(before) == len(payloads)
+
+        db.execute(
+            f"SELECT deltax.deltax_enable_compression('{table}', "
+            f"segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, table)
+
+        after = db.execute(
+            f"SELECT data::text FROM {table} ORDER BY ts"
+        ).fetchall()
+
+        assert after == before, (
+            "jsonb changed across compression — the SPI compress path is "
+            f"corrupting values.\nbefore={before}\nafter={after}"
+        )
+
+    def test_null_jsonb_survives_compression(self, db):
+        table = "jfidelity_null"
+        self._setup(db, table)
+        db.execute(
+            f"INSERT INTO {table} VALUES "
+            f"('{BASE_TS}'::timestamptz, 'dev-0', NULL), "
+            f"('{BASE_TS}'::timestamptz + interval '1 minute', 'dev-0', '{{\"a\": 1}}'::jsonb)"
+        )
+        db.commit()
+        before = db.execute(
+            f"SELECT data::text FROM {table} ORDER BY ts"
+        ).fetchall()
+
+        db.execute(
+            f"SELECT deltax.deltax_enable_compression('{table}', "
+            f"segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, table)
+
+        after = db.execute(
+            f"SELECT data::text FROM {table} ORDER BY ts"
+        ).fetchall()
+        assert after == before
+        assert before[0][0] is None  # NULL preserved as NULL, not '{}'
+
+
+# ---------------------------------------------------------------------------
+# Epoch-encoding regression tests (Unix epoch vs PG epoch, offset 946,684,800s)
+# ---------------------------------------------------------------------------
+
+class TestEpochEncoding:
+    """Regression tests for Unix-epoch vs PostgreSQL-epoch (2000-01-01,
+    offset 946,684,800 s) encoding confusions in segment metadata.
+
+    Three distinct bugs, all fixed in src/scan/exec/segments.rs:
+
+    1. Bloom probes hashed the raw PG-epoch datum of `col = const` /
+       `col IN (...)` constants while the bloom BUILD side (compress.rs)
+       hashes the colstats encoding (Unix-epoch microseconds for
+       timestamps/dates). Every segment was falsely bloom-rejected, so
+       equality predicates on timestamp/date columns returned ZERO rows
+       on compressed partitions.
+
+    2. The colstats min/max in-list filter identity-encoded raw PG-epoch
+       datums for timestamp/date IN-lists on non-time columns, while the
+       colstats `_min`/`_max` it compares against are Unix-epoch
+       microseconds — every segment falsely pruned, zero rows.
+
+    3. `load_segments_heap` stored the time column's meta-table
+       `_min_`/`_max_` identity-encoded (PG-epoch datum) in `ColMinMax`,
+       whose consumers all decode the colstats encoding (Unix-epoch us) —
+       timestamps 30 years early on any path consuming that map.
+
+    Year-2000-adjacent data makes the two encodings maximally divergent,
+    which is the shape that exposed these bugs.
+    """
+
+    EPOCH_NOW = "2000-01-15 12:00:00+00"
+    EPOCH_BASE = "2000-01-15 00:00:00+00"
+
+    def _setup_and_compress(self, db, n_rows=1000):
+        """Timestamp-sort-key table with year-2000 data, one compressed
+        partition. Rows are 1 second apart starting at EPOCH_BASE; row i has
+        val = i and d alternating between 2000-01-15 and 2000-01-16."""
+        db.execute(f"SET pg_deltax.mock_now = '{self.EPOCH_NOW}'")
+        db.execute("""
+            CREATE TABLE epoch_t (
+                ts TIMESTAMPTZ NOT NULL,
+                d DATE,
+                device_id TEXT NOT NULL,
+                val BIGINT
+            )
+        """)
+        db.execute(
+            "SELECT deltax.deltax_create_table('epoch_t', 'ts', '1 day'::interval)"
+        )
+        db.execute(
+            "SELECT deltax.deltax_enable_compression('epoch_t', "
+            "order_by => ARRAY['ts'])"
+        )
+        db.execute(f"""
+            INSERT INTO epoch_t
+            SELECT '{self.EPOCH_BASE}'::timestamptz + (i || ' seconds')::interval,
+                   CASE WHEN i % 2 = 0 THEN DATE '2000-01-15' ELSE DATE '2000-01-16' END,
+                   'dev-' || (i % 5)::text,
+                   i
+            FROM generate_series(0, {n_rows - 1}) i
+        """)
+        db.commit()
+
+        part_name = db.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('epoch_t') "
+            "WHERE range_start <= '2000-01-15'::timestamptz "
+            "AND range_end > '2000-01-15'::timestamptz"
+        ).fetchone()[0]
+        db.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
+        db.commit()
+        return part_name
+
+    def test_timestamp_equality_returns_matching_row(self, db):
+        """`ts = const` on the timestamp sort column must return the row.
+        Broken before the bloom-probe fix: the probe hashed the PG-epoch
+        datum, never matched the Unix-epoch build hashes, and every segment
+        was bloom-rejected (zero rows)."""
+        self._setup_and_compress(db)
+        rows = db.execute(
+            "SELECT ts, val FROM epoch_t WHERE ts = '2000-01-15 00:01:40+00'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][1] == 100
+
+    def test_timestamp_in_list_returns_matching_rows(self, db):
+        """`ts IN (...)` exercises the in-list bloom probe path."""
+        self._setup_and_compress(db)
+        rows = db.execute(
+            "SELECT val FROM epoch_t "
+            "WHERE ts IN ('2000-01-15 00:01:40+00', '2000-01-15 00:03:20+00') "
+            "ORDER BY val"
+        ).fetchall()
+        assert [r[0] for r in rows] == [100, 200]
+
+    def test_timestamp_equality_absent_value_returns_nothing(self, db):
+        """A constant inside the segment's [min, max] but absent from the
+        data must return zero rows — guards against an over-correction that
+        would defeat bloom pruning entirely."""
+        self._setup_and_compress(db)
+        count = db.execute(
+            "SELECT count(*) FROM epoch_t WHERE ts = '2000-01-15 00:10:00.5+00'"
+        ).fetchone()[0]
+        assert count == 0
+
+    def test_date_equality_on_non_sort_column(self, db):
+        """`d = const` on a DATE payload column probes the per-segment bloom
+        with the DATE encoding (PG-epoch days -> Unix-epoch microseconds)."""
+        self._setup_and_compress(db)
+        count = db.execute(
+            "SELECT count(*) FROM epoch_t WHERE d = DATE '2000-01-15'"
+        ).fetchone()[0]
+        assert count == 500
+        count = db.execute(
+            "SELECT count(*) FROM epoch_t WHERE d = DATE '2000-01-17'"
+        ).fetchone()[0]
+        assert count == 0
+
+    def test_date_in_list_on_non_sort_column(self, db):
+        """`d IN (...)` on a DATE payload column: both the bloom probe and
+        the colstats min/max in-list filter must compare in the colstats
+        domain (Unix-epoch microseconds). The in-list arm of the colstats
+        filter identity-encoded the raw PG-epoch datum, so every segment was
+        falsely min/max-pruned (zero rows)."""
+        self._setup_and_compress(db)
+        count = db.execute(
+            "SELECT count(*) FROM epoch_t "
+            "WHERE d IN (DATE '2000-01-15', DATE '2000-01-17')"
+        ).fetchone()[0]
+        assert count == 500
+        count = db.execute(
+            "SELECT count(*) FROM epoch_t "
+            "WHERE d IN (DATE '2000-01-17', DATE '2000-01-18')"
+        ).fetchone()[0]
+        assert count == 0
+
+    def test_min_max_of_timestamp_sort_column(self, db):
+        """MIN/MAX of the timestamp column served from segment metadata must
+        not come back 30 years early (meta-table min/max encoding fix).
+        Several aggregate shapes, since they route to different paths
+        (DeltaXMinMax, DeltaXAgg metadata fast path)."""
+        self._setup_and_compress(db)
+        lo, hi = db.execute("SELECT min(ts), max(ts) FROM epoch_t").fetchone()
+        assert str(lo) == "2000-01-15 00:00:00+00:00"
+        assert str(hi) == "2000-01-15 00:16:39+00:00"
+
+        lo, hi, cnt = db.execute(
+            "SELECT min(ts), max(ts), count(*) FROM epoch_t"
+        ).fetchone()
+        assert str(lo) == "2000-01-15 00:00:00+00:00"
+        assert str(hi) == "2000-01-15 00:16:39+00:00"
+        assert cnt == 1000
+
+        lo, avg = db.execute(
+            "SELECT min(ts), avg(val) FROM epoch_t"
+        ).fetchone()
+        assert str(lo) == "2000-01-15 00:00:00+00:00"
+        assert float(avg) == 499.5
+
+    def test_range_predicates_across_year_2000(self, db):
+        """Range predicates with year-2000-adjacent constants: segment
+        min/max metadata must neither falsely skip (zero rows) nor falsely
+        all-pass (every row) when classified against the encoded constant."""
+        self._setup_and_compress(db)
+        sum_, cnt = db.execute(
+            "SELECT sum(val), count(*) FROM epoch_t "
+            "WHERE ts <= '2000-01-15 00:01:39+00'"
+        ).fetchone()
+        assert (sum_, cnt) == (4950, 100)
+
+        sum_, cnt = db.execute(
+            "SELECT sum(val), count(*) FROM epoch_t "
+            "WHERE ts >= '2000-01-15 00:01:40+00'"
+        ).fetchone()
+        assert (sum_, cnt) == (494550, 900)
+
+        # Fully outside the data range on either side of the data
+        cnt = db.execute(
+            "SELECT count(*) FROM epoch_t WHERE ts < '2000-01-15 00:00:00+00'"
+        ).fetchone()[0]
+        assert cnt == 0
+        cnt = db.execute(
+            "SELECT count(*) FROM epoch_t WHERE ts > '2000-01-15 00:16:39+00'"
+        ).fetchone()[0]
+        assert cnt == 0
+
+
+# ---------------------------------------------------------------------------
+# Cross-schema companion disambiguation
+# ---------------------------------------------------------------------------
+
+def test_same_named_partition_in_other_schema_not_hijacked(db):
+    """Two deltax tables with the same name in different schemas produce
+    identically-named partitions. Companion tables live in the single shared
+    `_deltax_compressed` namespace and embed only the partition NAME, so the
+    scan hook's companion lookup must verify via the catalog that the
+    (schema-qualified) partition it is planning is actually the compressed
+    one. Regression: compressing s1's partition made the hook treat s2's
+    same-named, UNCOMPRESSED partition as compressed and serve s1's data."""
+    db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+    for s in ("s1", "s2"):
+        db.execute(f"CREATE SCHEMA {s}")
+        db.execute(f"""
+            CREATE TABLE {s}.events (
+                ts  TIMESTAMPTZ NOT NULL,
+                val INT NOT NULL
+            )
+        """)
+        db.execute(
+            f"SELECT deltax.deltax_create_table('{s}.events', 'ts', "
+            "'1 day'::interval)"
+        )
+    db.commit()
+
+    # Distinct payloads per schema so any cross-wiring is visible.
+    for s, base in (("s1", 1000), ("s2", 2000)):
+        values = ", ".join(
+            f"('{BASE_TS}'::timestamptz + interval '{i} minutes', {base + i})"
+            for i in range(50)
+        )
+        db.execute(f"INSERT INTO {s}.events (ts, val) VALUES {values}")
+    db.commit()
+
+    # Sanity: the partition names collide across the two schemas.
+    parts1 = {
+        r[0]
+        for r in db.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('s1.events')"
+        ).fetchall()
+    }
+    parts2 = {
+        r[0]
+        for r in db.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('s2.events')"
+        ).fetchall()
+    }
+    assert parts1 == parts2, f"expected colliding names, got {parts1} vs {parts2}"
+
+    # Compress only s1's data-bearing partition.
+    db.execute(
+        "SELECT deltax.deltax_enable_compression('s1.events', "
+        "order_by => ARRAY['ts'])"
+    )
+    db.commit()
+    target = None
+    for p in sorted(parts1):
+        if "default" in p:
+            continue
+        if db.execute(f'SELECT count(*) FROM s1."{p}"').fetchone()[0]:
+            target = p
+            break
+    assert target is not None
+    db.execute(f"SELECT deltax.deltax_compress_partition('s1.{target}')")
+    db.commit()
+
+    # s1 reads its data through the companion.
+    vals1 = [
+        r[0]
+        for r in db.execute("SELECT val FROM s1.events ORDER BY val").fetchall()
+    ]
+    assert vals1 == list(range(1000, 1050))
+
+    # s2 is NOT compressed — it must read its own heap, not s1's companion.
+    vals2 = [
+        r[0]
+        for r in db.execute("SELECT val FROM s2.events ORDER BY val").fetchall()
+    ]
+    assert vals2 == list(range(2000, 2050)), (
+        f"s2.events returned wrong rows — its partition was hijacked by "
+        f"s1's same-named compressed partition: {vals2[:5]}..."
+    )
+
+    # Scanning s2's partition directly must hit its heap too.
+    n = db.execute(f'SELECT count(*) FROM s2."{target}"').fetchone()[0]
+    assert n == 50, f"direct scan of s2 partition returned {n} rows"
