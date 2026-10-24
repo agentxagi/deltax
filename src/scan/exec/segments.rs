@@ -240,6 +240,30 @@ unsafe fn lookup_segments_by_minmax_index(
     }
 }
 
+/// Convert a batch-qual constant (raw PG datum bits) into the i64 domain the
+/// bloom BUILD side hashed (`compress.rs` hashes `TypedColumn` values, which
+/// store timestamps/dates as Unix-epoch microseconds and floats as raw bit
+/// patterns). Probing with the raw PG-epoch datum would never match the
+/// build-side hashes — every segment would be falsely bloom-rejected and
+/// `col = const` on a timestamp/date column would return zero rows.
+fn bloom_probe_encode(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> i64 {
+    match type_oid {
+        pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {
+            // PG-epoch µs → Unix-epoch µs (matches TypedColumn::Int64 build).
+            (datum.value() as i64) + crate::compress::PG_EPOCH_OFFSET_USEC
+        }
+        pg_sys::DATEOID => {
+            // PG-epoch days (int32 datum) → Unix-epoch µs.
+            ((datum.value() as i32 as i64) + crate::compress::PG_EPOCH_OFFSET_DAYS) * 86_400_000_000
+        }
+        // f32 bit pattern occupies the low 32 datum bits (build hashes
+        // `x.to_bits() as i64`).
+        pg_sys::FLOAT4OID => (datum.value() as u32) as i64,
+        // Integers and f64 bit patterns are identity.
+        _ => datum.value() as i64,
+    }
+}
+
 /// Resolve `{partition}_<suffix>` (where the partition name is derived
 /// from `meta_oid` by stripping the `_meta` suffix) to a relation OID in
 /// the same namespace as `meta_oid`. Returns `InvalidOid` when the table
@@ -1922,18 +1946,21 @@ pub(super) unsafe fn load_segments_heap(
                 let hashes = if bq.op == BatchCompareOp::InList {
                     if let Some(ref vals) = bq.in_list_i64 {
                         vals.iter()
-                            .map(|&v| crate::bloom::hash_datum_i64(v))
+                            .map(|&v| {
+                                crate::bloom::hash_datum_i64(bloom_probe_encode(
+                                    pg_sys::Datum::from(v as usize),
+                                    bq.type_oid,
+                                ))
+                            })
                             .collect()
                     } else {
                         continue;
                     }
                 } else {
-                    let val_i64 = match bq.type_oid {
-                        pg_sys::FLOAT4OID => (bq.const_datum.value() as u32) as i64,
-                        pg_sys::FLOAT8OID => bq.const_datum.value() as i64,
-                        _ => bq.const_datum.value() as i64,
-                    };
-                    vec![crate::bloom::hash_datum_i64(val_i64)]
+                    vec![crate::bloom::hash_datum_i64(bloom_probe_encode(
+                        bq.const_datum,
+                        bq.type_oid,
+                    ))]
                 };
                 bloom_checks.push(BloomCheck {
                     col_idx: ci,
@@ -2055,20 +2082,29 @@ pub(super) unsafe fn load_segments_heap(
 
             // --- Segment survived time/segment_by pruning ---
 
-            // Extract per-column min/max (time column from meta — identity encoding for timestamp/date)
+            // Extract per-column min/max. The meta table stores the time
+            // column's `_min_`/`_max_` in its NATIVE type (PG-epoch datum),
+            // but every `ColMinMax` consumer (`decode_encoded_to_datum`,
+            // `decode_encoded_to_pg_i64`, `segment_all_rows_pass`, ...)
+            // expects the order-preserving colstats encoding (Unix-epoch
+            // microseconds for timestamps/dates) — so convert here with the
+            // same `encode_datum_to_i64` rule used to populate colstats.
             let mut col_minmax = HashMap::new();
             for (col_name, min_att, max_att, type_oid) in &minmax_col_attnos {
                 let min_null = nulls[*min_att];
                 let max_null = nulls[*max_att];
+                let encode_meta = |d: pg_sys::Datum| -> i64 {
+                    encode_datum_to_i64(d, *type_oid).unwrap_or_else(|| d.value() as i64)
+                };
                 let min_enc = if min_null {
                     0i64
                 } else {
-                    values[*min_att].value() as i64
+                    encode_meta(values[*min_att])
                 };
                 let max_enc = if max_null {
                     0i64
                 } else {
-                    values[*max_att].value() as i64
+                    encode_meta(values[*max_att])
                 };
                 col_minmax.insert(
                     col_name.clone(),
@@ -2289,22 +2325,25 @@ pub(super) unsafe fn load_segments_heap(
                         None => continue,
                     };
 
-                    // For float in-list, re-encode from raw datum bits to order-preserving i64
-                    let encoded_in_list = bq.in_list_i64.as_ref().map(|vals| {
-                        vals.iter()
+                    // `in_list_i64` holds raw PG datum bits — re-encode each
+                    // value into the colstats domain with the same rule as
+                    // `const_i64` above (timestamps/dates: PG epoch → Unix
+                    // epoch; floats: order-preserving bits; ints: identity).
+                    let encoded_in_list = match bq.in_list_i64.as_ref() {
+                        None => None,
+                        Some(vals) => match vals
+                            .iter()
                             .map(|&v| {
-                                match bq.type_oid {
-                                    pg_sys::FLOAT4OID => {
-                                        encode_f32_to_i64(f32::from_bits(v as u32))
-                                    }
-                                    pg_sys::FLOAT8OID => {
-                                        encode_f64_to_i64(f64::from_bits(v as u64))
-                                    }
-                                    _ => v, // int/timestamp/date: identity
-                                }
+                                encode_datum_to_i64(pg_sys::Datum::from(v as usize), bq.type_oid)
                             })
-                            .collect()
-                    });
+                            .collect::<Option<Vec<i64>>>()
+                        {
+                            Some(enc) => Some(enc),
+                            // Unencodable element — skip minmax pruning for
+                            // this qual rather than risk a wrong prune.
+                            None => continue,
+                        },
+                    };
 
                     cs_minmax_filters.push(MinMaxFilter {
                         col_idx: ci,
@@ -4150,6 +4189,32 @@ mod tests {
             max_null: false,
             type_oid,
         }
+    }
+
+    #[test]
+    fn bloom_probe_encode_matches_build_domain() {
+        // Integers: identity.
+        assert_eq!(
+            bloom_probe_encode(pg_sys::Datum::from(42i64 as usize), pg_sys::INT8OID),
+            42
+        );
+        // Timestamps: PG-epoch usec -> Unix-epoch usec (the domain
+        // TypedColumn::Int64 stores and the bloom build hashes).
+        assert_eq!(
+            bloom_probe_encode(pg_sys::Datum::from(0i64 as usize), pg_sys::TIMESTAMPTZOID),
+            crate::compress::PG_EPOCH_OFFSET_USEC
+        );
+        // Dates: PG-epoch days -> Unix-epoch usec.
+        assert_eq!(
+            bloom_probe_encode(pg_sys::Datum::from(1i32 as usize), pg_sys::DATEOID),
+            (crate::compress::PG_EPOCH_OFFSET_DAYS + 1) * 86_400_000_000
+        );
+        // f32: low 32 datum bits = bit pattern.
+        let f = 1.5f32;
+        assert_eq!(
+            bloom_probe_encode(pg_sys::Datum::from(f.to_bits() as usize), pg_sys::FLOAT4OID),
+            f.to_bits() as i64
+        );
     }
 
     #[test]
