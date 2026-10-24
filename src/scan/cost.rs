@@ -727,89 +727,34 @@ fn parse_i64(bytes: &[u8], start: usize) -> Option<(i64, usize)> {
     s.parse::<i64>().ok().map(|v| (v, i))
 }
 
-/// Parse a `{"col": ["v0","v1",...], ...}` JSON object (as emitted by
-/// `catalog::update_partition_column_valmap`). Trivial hand-rolled parser —
-/// values are quoted strings, keys are column names with `\\` and `\"`
-/// escapes. Lenient: malformed input → leave `out` partially populated.
+/// Parse the `column_valmap` catalog JSON, `{"col": ["v0", "v1", ...], ...}`
+/// (written by `catalog::update_partition_column_valmap`, read back through
+/// `jsonb::text`, so values may carry any JSON escape and raw UTF-8).
+///
+/// A value's array index is its bit in every segment's valbitmap, and the
+/// pruner looks the query constant up by exact string equality. So a column
+/// is kept only when every element is a string: dropping or misreading one
+/// element would shift or break the bit positions. Malformed JSON, a
+/// non-array entry or a non-string element leaves that column out, which
+/// disables valbitmap pruning for it — always the safe direction.
 fn parse_valmap_json(text: &str, out: &mut std::collections::HashMap<String, Vec<String>>) {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() || bytes[i] != b'{' {
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
-    }
-    i += 1;
-
-    loop {
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
-            i += 1;
+    };
+    for (name, val) in obj {
+        let serde_json::Value::Array(arr) = val else {
+            continue;
+        };
+        let vals: Option<Vec<String>> = arr
+            .into_iter()
+            .map(|v| match v {
+                serde_json::Value::String(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        if let Some(vals) = vals {
+            out.insert(name, vals);
         }
-        if i >= bytes.len() || bytes[i] == b'}' {
-            return;
-        }
-        if bytes[i] != b'"' {
-            return;
-        }
-        i += 1;
-
-        // Key.
-        let mut key = String::new();
-        while i < bytes.len() && bytes[i] != b'"' {
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                key.push(bytes[i + 1] as char);
-                i += 2;
-            } else {
-                key.push(bytes[i] as char);
-                i += 1;
-            }
-        }
-        if i >= bytes.len() {
-            return;
-        }
-        i += 1;
-
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b':') {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b'[' {
-            return;
-        }
-        i += 1;
-
-        let mut vals: Vec<String> = Vec::new();
-        loop {
-            while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
-                i += 1;
-            }
-            if i >= bytes.len() || bytes[i] == b']' {
-                break;
-            }
-            if bytes[i] != b'"' {
-                return;
-            }
-            i += 1;
-            let mut v = String::new();
-            while i < bytes.len() && bytes[i] != b'"' {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    v.push(bytes[i + 1] as char);
-                    i += 2;
-                } else {
-                    v.push(bytes[i] as char);
-                    i += 1;
-                }
-            }
-            if i >= bytes.len() {
-                return;
-            }
-            i += 1;
-            vals.push(v);
-        }
-        if i < bytes.len() && bytes[i] == b']' {
-            i += 1;
-        }
-        out.insert(key, vals);
     }
 }
 
@@ -1081,5 +1026,44 @@ mod tests {
         parse_valmap_json(r#"{"event":["click\"ed","back\\slash"]}"#, &mut out);
         let v = out.get("event").cloned().unwrap();
         assert_eq!(v, vec!["click\"ed".to_string(), "back\\slash".to_string()]);
+    }
+
+    #[test]
+    fn parse_valmap_json_keeps_utf8_and_json_escapes() {
+        // `jsonb::text` emits non-ASCII as raw UTF-8 and control characters
+        // as `\n` / `\uXXXX`. Each value must come back exactly, or the
+        // pruner's lookup of the query constant misses.
+        let mut out = HashMap::new();
+        parse_valmap_json(
+            r#"{"operação": ["exportação", "multi\nline", "tab\tand\u0001", "日本"]}"#,
+            &mut out,
+        );
+        assert_eq!(
+            out.get("operação").cloned(),
+            Some(vec![
+                "exportação".to_string(),
+                "multi\nline".to_string(),
+                "tab\tand\u{1}".to_string(),
+                "日本".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_valmap_json_drops_columns_it_cannot_read_exactly() {
+        // A non-string element would shift the bit positions of the ones
+        // after it: the whole column goes, the others stay.
+        let mut out = HashMap::new();
+        parse_valmap_json(
+            r#"{"bad": ["a", 1, "b"], "good": ["x"], "obj": {}}"#,
+            &mut out,
+        );
+        assert_eq!(out.get("bad"), None);
+        assert_eq!(out.get("obj"), None);
+        assert_eq!(out.get("good").cloned(), Some(vec!["x".to_string()]));
+
+        let mut garbage = HashMap::new();
+        parse_valmap_json(r#"{"col": ["a", "b""#, &mut garbage);
+        assert!(garbage.is_empty());
     }
 }

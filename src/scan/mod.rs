@@ -7,6 +7,8 @@ pub(crate) mod exec;
 mod explain;
 mod hook;
 pub(crate) mod json_extract;
+#[cfg(any(test, feature = "pg_test"))]
+mod oracle_tests;
 mod path;
 mod plan_profile;
 
