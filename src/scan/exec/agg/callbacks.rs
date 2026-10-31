@@ -387,8 +387,12 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
 
             // Extract batch quals early for the filtered metadata fast path
             let fast_batch_quals = if !plan.where_quals.is_null() {
-                let (bqs, handled) =
-                    extract_batch_quals(plan.where_quals, &meta.col_names, &meta.col_types);
+                let (bqs, handled) = extract_batch_quals(
+                    plan.where_quals,
+                    &meta.col_names,
+                    &meta.col_types,
+                    &meta.segment_by,
+                );
                 if handled as i32 == (*plan.where_quals).length {
                     bqs
                 } else {
@@ -598,8 +602,12 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
             .collect();
 
         // Extract batch quals and segment filters from WHERE clause (quals from custom_private)
-        let (batch_quals, _handled_count) =
-            extract_batch_quals(where_quals, &meta.col_names, &meta.col_types);
+        let (batch_quals, _handled_count) = extract_batch_quals(
+            where_quals,
+            &meta.col_names,
+            &meta.col_types,
+            &meta.segment_by,
+        );
 
         for bq in &batch_quals {
             if bq.col_idx < num_cols {

@@ -78,8 +78,12 @@ pub(super) unsafe fn build_agg_exec_context_from_plan(plan: ParsedAggPlan) -> Ag
             }
         }
 
-        let (batch_quals, _handled) =
-            extract_batch_quals(where_quals, &meta.col_names, &meta.col_types);
+        let (batch_quals, _handled) = extract_batch_quals(
+            where_quals,
+            &meta.col_names,
+            &meta.col_types,
+            &meta.segment_by,
+        );
         for bq in &batch_quals {
             if bq.col_idx < num_cols {
                 needed_cols[bq.col_idx] = true;

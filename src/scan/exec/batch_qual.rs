@@ -661,10 +661,15 @@ pub(super) fn evaluate_batch_quals(
 /// of qual list nodes that were successfully converted to batch quals. When
 /// `handled_count == list_length(qual_list)`, all quals are handled by batch
 /// evaluation and PG's per-row ExecQual can be skipped.
+///
+/// A text qual on a `segment_by` column is pushed only when it is the
+/// equality that segment pruning applies (`segment_eq_operands`); `<>`, LIKE,
+/// NOT LIKE and IN on such a column are left to PostgreSQL.
 pub(super) unsafe fn extract_batch_quals(
     qual_list: *mut pg_sys::List,
     col_names: &[String],
     col_types: &[pg_sys::Oid],
+    segment_by: &[String],
 ) -> (Vec<BatchQual>, usize) {
     let mut batch_quals = Vec::new();
 
@@ -759,6 +764,9 @@ pub(super) unsafe fn extract_batch_quals(
                 }
                 let sa_col_idx = (sa_varattno - 1) as usize;
                 let sa_type_oid = col_types[sa_col_idx];
+                if is_text_type(sa_type_oid) && segment_by.contains(&col_names[sa_col_idx]) {
+                    continue; // IN on a segment_by text column: see the doc comment
+                }
                 let (in_list_i64, in_list_text) = match in_list_values(saop, sa_type_oid) {
                     Some(InListValues::Numeric(values)) => (Some(values), None),
                     Some(InListValues::Text(values)) => (None, Some(values)),
@@ -871,6 +879,9 @@ pub(super) unsafe fn extract_batch_quals(
                 ) {
                     continue;
                 }
+                if segment_by.contains(&col_names[col_idx]) {
+                    continue; // LIKE on a segment_by column: see the doc comment
+                }
                 // Extract pattern string from constant datum
                 let varlena_ptr = (*const_node).constvalue.cast_mut_ptr::<pg_sys::varlena>();
                 let len = pgrx::varsize_any_exhdr(varlena_ptr);
@@ -902,6 +913,13 @@ pub(super) unsafe fn extract_batch_quals(
                 // `text = name` resolves to a cross-type operator: a `name`
                 // constant is not a varlena and cannot be read as text.
                 if !is_text_type((*const_node).consttype) {
+                    continue;
+                }
+                // On a segment_by column only the equality segment pruning
+                // applies is pushed: see the doc comment.
+                if segment_by.contains(&col_names[col_idx])
+                    && (cmp_op != BatchCompareOp::Eq || segment_eq_operands(node).is_none())
+                {
                     continue;
                 }
                 let varlena_ptr = (*const_node).constvalue.cast_mut_ptr::<pg_sys::varlena>();
