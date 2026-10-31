@@ -1171,4 +1171,60 @@ mod tests {
             assert!(!is_text_type(bad));
         }
     }
+
+    /// `in_list_values` decodes an array constant whatever its varlena form.
+    /// Here the array has a one-byte header, as a short value has on disk:
+    /// a valid datum, but its header is not an `ArrayType` until it is
+    /// detoasted. (`makeConst` detoasts, so SQL alone does not build one.)
+    #[pgrx::pg_test]
+    fn in_list_values_detoasts_the_array() {
+        unsafe {
+            let opno = pgrx::Spi::get_one::<i64>("SELECT '=(int8,int8)'::regoperator::oid::int8")
+                .unwrap()
+                .unwrap();
+            let opno = pg_sys::Oid::from(opno as u32);
+            let mut elems = [pg_sys::Datum::from(5i64), pg_sys::Datum::from(1005i64)];
+            let flat = pg_sys::construct_array_builtin(elems.as_mut_ptr(), 2, pg_sys::INT8OID);
+            let total = pgrx::varsize_any(flat as *const pg_sys::varlena);
+            let short_len = total - 4 + 1;
+            assert!(
+                short_len <= 0x7f,
+                "a one-byte header holds at most 127 bytes"
+            );
+            let short = pg_sys::palloc0(short_len) as *mut u8;
+            *short = ((short_len as u8) << 1) | 1;
+            std::ptr::copy_nonoverlapping((flat as *const u8).add(4), short.add(1), total - 4);
+
+            let in_list_over = |array: pg_sys::Datum| -> Option<Vec<i64>> {
+                let c = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
+                (*c).xpr.type_ = pg_sys::NodeTag::T_Const;
+                (*c).consttype = pg_sys::INT8ARRAYOID;
+                (*c).consttypmod = -1;
+                (*c).constlen = -1;
+                (*c).constvalue = array;
+                (*c).location = -1;
+                let saop = pg_sys::palloc0(std::mem::size_of::<pg_sys::ScalarArrayOpExpr>())
+                    as *mut pg_sys::ScalarArrayOpExpr;
+                (*saop).xpr.type_ = pg_sys::NodeTag::T_ScalarArrayOpExpr;
+                (*saop).opno = opno;
+                (*saop).useOr = true;
+                let args = pg_sys::lappend(std::ptr::null_mut(), c.cast());
+                (*saop).args = pg_sys::lappend(args, c.cast());
+                match in_list_values(saop, pg_sys::INT8OID) {
+                    Some(InListValues::Numeric(values)) => Some(values),
+                    _ => None,
+                }
+            };
+            assert_eq!(
+                in_list_over(pg_sys::Datum::from(flat)),
+                Some(vec![5, 1005]),
+                "flat array"
+            );
+            assert_eq!(
+                in_list_over(pg_sys::Datum::from(short)),
+                Some(vec![5, 1005]),
+                "one-byte-header array"
+            );
+        }
+    }
 }

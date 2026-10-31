@@ -46,6 +46,23 @@
 //!    pruned every segment (0 rows instead of 1100), a `smallint` compared
 //!    with 65539 used the truncated constant 3, a `float8` constant was read
 //!    as a `float4` and a `name` as `text`.
+//!
+//! FB-0284 (independent review of FB-0275, 2026-10-31):
+//!
+//! 8. A text qual other than `=` on a segment_by column (`<>`, LIKE, NOT
+//!    LIKE, IN) was accepted by the DeltaXAgg gate and counted as handled by
+//!    the row path, but only segment pruning ever applies a segment_by qual,
+//!    and it handles `=` alone: `tenant_id <> 'big'` returned every row. The
+//!    parallel DeltaXAgg did apply them, so the answer depended on the worker
+//!    count.
+//! 9. HAVING compared the aggregate with the constant as raw 64-bit words,
+//!    and serialised the constant in 32 bits: `HAVING avg(x) > 2` compared a
+//!    numeric pointer, and `HAVING count(x) < 4294967297` compared with 1.
+//! 10. segment_by on a varchar column: the column reaches the quals under a
+//!     RelabelType to text, which segment pruning did not recognise, while
+//!     the row path counted the pushed equality as handled and the
+//!     metadata-only aggregates relied on the missing filter: `dev = 'd1'`
+//!     returned all four devices.
 
 #[pgrx::pg_schema]
 mod tests {
@@ -93,6 +110,23 @@ mod tests {
         })
     }
 
+    /// Compress every non-empty partition of `table`. The rows' day has to be
+    /// over before its partition may be compressed.
+    fn compress_partitions(table: &str) {
+        run("SET LOCAL pg_deltax.mock_now = '2025-01-20 00:00:00+00'");
+        run(&format!(
+            "DO $$
+             DECLARE p text; n bigint;
+             BEGIN
+                 FOR p IN SELECT partition_name FROM deltax.deltax_partition_info('{table}')
+                 LOOP
+                     EXECUTE format('SELECT count(*) FROM %I', p) INTO n;
+                     IF n > 0 THEN PERFORM deltax.deltax_compress_partition(p); END IF;
+                 END LOOP;
+             END $$"
+        ));
+    }
+
     /// One compressed partition shaped like `usage_events_p20260705`:
     /// segment_by `tenant_id`, one segment per tenant. Tenant `big` has 40
     /// distinct operations (over the cap → no valbitmap row) and is the only
@@ -132,17 +166,7 @@ mod tests {
         run("SELECT deltax.deltax_enable_compression('fb0256_events',
                  segment_by => ARRAY['tenant_id'],
                  order_by => ARRAY['tenant_id', 'created_at'])");
-        // The rows' day has to be over before its partition may be compressed.
-        run("SET LOCAL pg_deltax.mock_now = '2025-01-20 00:00:00+00'");
-        run("DO $$
-             DECLARE p text; n bigint;
-             BEGIN
-                 FOR p IN SELECT partition_name FROM deltax.deltax_partition_info('fb0256_events')
-                 LOOP
-                     EXECUTE format('SELECT count(*) FROM %I', p) INTO n;
-                     IF n > 0 THEN PERFORM deltax.deltax_compress_partition(p); END IF;
-                 END LOOP;
-             END $$");
+        compress_partitions("fb0256_events");
 
         // Every row lives in the compressed partition, and the valmap has the
         // shape that triggered FB-0256: present for `operation`, built from
@@ -188,16 +212,22 @@ mod tests {
     /// list, which trips an assertion of cassert builds of PostgreSQL 18 (a
     /// separate defect).
     fn assert_rows_match(pred: &str) -> i64 {
+        assert_rows_match_in("fb0256_events", "fb0256_ref", pred)
+    }
+
+    /// `assert_rows_match` for the compressed `table` and its heap copy
+    /// `reference`.
+    fn assert_rows_match_in(table: &str, reference: &str, pred: &str) -> i64 {
         let count = |t: &str| one_i64(&format!("SELECT count(id) FROM {t} WHERE {pred}"));
-        let got = count("fb0256_events");
-        assert_eq!(got, count("fb0256_ref"), "count(id) WHERE {pred}");
+        let got = count(table);
+        assert_eq!(got, count(reference), "count(id) FROM {table} WHERE {pred}");
         let ids = |t: &str| {
             one_text(&format!(
                 "SELECT string_agg(id::text, ',' ORDER BY id) FROM (
                      SELECT id FROM {t} WHERE {pred} ORDER BY id LIMIT 2000) s"
             ))
         };
-        assert_eq!(ids("fb0256_events"), ids("fb0256_ref"), "rows WHERE {pred}");
+        assert_eq!(ids(table), ids(reference), "rows FROM {table} WHERE {pred}");
         got
     }
 
@@ -493,5 +523,182 @@ mod tests {
         ] {
             assert_eq!(assert_rows_match(pred), want, "count(id) WHERE {pred}");
         }
+    }
+
+    #[pg_test]
+    fn text_quals_on_segment_by_match() {
+        setup();
+
+        // tenant_id is the segment_by column. Segment pruning applies `=` on
+        // it; `<>`, LIKE, NOT LIKE and IN must be left to PostgreSQL.
+        for (pred, want) in [
+            ("tenant_id IN ('big', 'small-1')", 900),
+            ("tenant_id = ANY(ARRAY['big', 'small-1'])", 900),
+            (
+                "tenant_id IN ('big', 'small-1') AND created_at >= '2025-01-15 06:05:00+00'",
+                501,
+            ),
+            ("tenant_id <> 'big'", 300),
+            ("tenant_id LIKE 'small%'", 300),
+            ("tenant_id NOT LIKE 'small%'", 800),
+            ("tenant_id <> 'big' AND kind = 1", 60),
+            // Controls: the equality segment pruning applies.
+            ("tenant_id = 'big'", 800),
+            ("'big' = tenant_id", 800),
+            ("tenant_id = 'big' AND operation = 'memory_used'", 20),
+        ] {
+            assert_eq!(assert_rows_match(pred), want, "count(id) WHERE {pred}");
+        }
+        assert_pushed_to_agg("tenant_id = 'big' AND operation = 'memory_used'");
+
+        // The same through the compressed partition queried directly: the
+        // gate finds the segment_by columns through the partition's parent,
+        // and a text qual on another column keeps its pushdown.
+        let partition = one_text(
+            "SELECT table_name FROM deltax.deltax_partition
+              WHERE table_name LIKE 'fb0256_events%' AND is_compressed",
+        )
+        .expect("fixture: one compressed partition");
+        assert_eq!(
+            one_i64(&format!(
+                "SELECT count(id) FROM {partition} WHERE tenant_id <> 'big'"
+            )),
+            300,
+            "count(id) FROM {partition} WHERE tenant_id <> 'big'"
+        );
+        let plan = explain(&format!(
+            "SELECT count(id) FROM {partition} WHERE operation LIKE 'op1%'"
+        ));
+        assert!(
+            plan.contains("DeltaXAgg"),
+            "expected DeltaXAgg on {partition}, got:\n{plan}"
+        );
+
+        // GROUP BY the segment_by column runs the parallel DeltaXAgg when it
+        // has workers, which applied these quals, and the serial one when it
+        // does not, which dropped them. count(tenant_id) keeps the scan to one
+        // column.
+        for workers in [1, 0] {
+            run(&format!("SET LOCAL pg_deltax.parallel_workers = {workers}"));
+            for pred in [
+                "tenant_id <> 'big'",
+                "tenant_id IN ('big', 'small-1')",
+                "tenant_id LIKE 'small%'",
+                "tenant_id NOT LIKE 'small%'",
+            ] {
+                let groups = |t: &str| {
+                    one_text(&format!(
+                        "SELECT string_agg(tenant_id || '=' || n, ',' ORDER BY tenant_id) FROM (
+                             SELECT tenant_id, count(tenant_id) AS n FROM {t}
+                              WHERE {pred} GROUP BY tenant_id) s"
+                    ))
+                };
+                assert_eq!(
+                    groups("fb0256_events"),
+                    groups("fb0256_ref"),
+                    "parallel_workers = {workers}: GROUP BY tenant_id WHERE {pred}"
+                );
+            }
+        }
+    }
+
+    #[pg_test]
+    fn having_matches() {
+        setup();
+
+        // kind holds 0..4, 220 rows each.
+        for (select, having, want) in [
+            // The constant does not fit 32 bits.
+            ("count(kind)", "count(kind) < 4294967297", "0,1,2,3,4"),
+            // avg is numeric: DeltaXAgg compared the pointer.
+            ("avg(kind)", "avg(kind) > 2", "3,4"),
+            // Control: an int8 aggregate against an int4 constant.
+            ("sum(kind)", "sum(kind) > 300", "2,3,4"),
+        ] {
+            let groups = |t: &str| {
+                one_text(&format!(
+                    "SELECT string_agg(kind || '=' || v, ',' ORDER BY kind) FROM (
+                         SELECT kind, {select} AS v FROM {t} GROUP BY kind HAVING {having}) s"
+                ))
+            };
+            let got = groups("fb0256_events");
+            assert_eq!(got, groups("fb0256_ref"), "GROUP BY kind HAVING {having}");
+            let kinds: Vec<&str> = got
+                .as_deref()
+                .unwrap_or("")
+                .split(',')
+                .filter_map(|g| g.split('=').next())
+                .filter(|k| !k.is_empty())
+                .collect();
+            assert_eq!(kinds.join(","), want, "GROUP BY kind HAVING {having}");
+        }
+        let plan = explain(
+            "SELECT kind, sum(kind) FROM fb0256_events GROUP BY kind HAVING sum(kind) > 300",
+        );
+        assert!(
+            plan.contains("DeltaXAgg"),
+            "expected DeltaXAgg, got:\n{plan}"
+        );
+    }
+
+    /// segment_by on a varchar column: `dev = 'd1'` compares the column,
+    /// under a RelabelType to text, with a text constant. 400 rows, one
+    /// segment per device, 100 rows each.
+    fn setup_devices() {
+        run("SET LOCAL pg_deltax.mock_now = '2025-01-15 12:00:00+00'");
+        run("CREATE TABLE fb0284_devices (
+                 id         bigint      NOT NULL,
+                 dev        varchar(10) NOT NULL,
+                 created_at timestamptz NOT NULL,
+                 x          int4
+             )");
+        run("SELECT deltax.deltax_create_table('fb0284_devices', 'created_at', '1 day'::interval)");
+        run("INSERT INTO fb0284_devices
+             SELECT i, 'd' || (i % 4),
+                    '2025-01-15 06:00:00+00'::timestamptz + i * interval '1 second', i
+               FROM generate_series(1, 400) i");
+        run("CREATE TABLE fb0284_devices_ref AS SELECT * FROM fb0284_devices");
+        run("SELECT deltax.deltax_enable_compression('fb0284_devices',
+                 segment_by => ARRAY['dev'],
+                 order_by => ARRAY['dev', 'created_at'])");
+        compress_partitions("fb0284_devices");
+    }
+
+    #[pg_test]
+    fn varchar_segment_by_matches() {
+        setup_devices();
+
+        for (pred, want) in [
+            ("dev = 'd1'", 100),
+            ("dev = 'd1' AND x > 0", 100),
+            ("dev <> 'd1'", 300),
+            ("dev IN ('d1', 'd2')", 200),
+            ("dev LIKE 'd1%'", 100),
+            ("dev NOT LIKE 'd1%'", 300),
+        ] {
+            assert_eq!(
+                assert_rows_match_in("fb0284_devices", "fb0284_devices_ref", pred),
+                want,
+                "count(id) WHERE {pred}"
+            );
+        }
+        // The metadata-only aggregates answer from the segment filter.
+        for agg in ["count(*)", "max(created_at)", "min(id)"] {
+            let value = |t: &str| {
+                one_text(&format!(
+                    "SELECT v::text FROM (SELECT {agg} AS v FROM {t} WHERE dev = 'd1') s"
+                ))
+            };
+            assert_eq!(
+                value("fb0284_devices"),
+                value("fb0284_devices_ref"),
+                "{agg} WHERE dev = 'd1'"
+            );
+        }
+        let plan = explain("SELECT count(*) FROM fb0284_devices WHERE dev = 'd1'");
+        assert!(
+            plan.contains("DeltaXCount"),
+            "expected DeltaXCount, got:\n{plan}"
+        );
     }
 }
