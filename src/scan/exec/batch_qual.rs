@@ -235,8 +235,12 @@ pub(in crate::scan) unsafe fn in_list_values(
         if !is_numeric_in && !is_text_in {
             return None;
         }
-        // Deconstruct the array constant to extract element values
-        let array_ptr = (*sa_const).constvalue.cast_mut_ptr::<pg_sys::ArrayType>();
+        // Deconstruct the array constant to extract element values. Detoast
+        // first: the header of a compressed, external or short-header array
+        // is not an ArrayType.
+        let array_ptr =
+            pg_sys::pg_detoast_datum((*sa_const).constvalue.cast_mut_ptr::<pg_sys::varlena>())
+                as *mut pg_sys::ArrayType;
         if (*array_ptr).ndim != 1 {
             return None; // only 1-D arrays
         }
