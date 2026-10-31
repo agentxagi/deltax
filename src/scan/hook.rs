@@ -987,16 +987,11 @@ unsafe fn classify_meta_qual_node(
             // only matches `=`, and equality on segment_by is safe
             // because segmentation partitions rows along that value
             // (every row in a surviving segment satisfies the eq).
-            // It applies the filter only to a constant that converts
-            // exactly to the column's type (`const_datum_for_column`);
-            // accepting any other constant here would count every segment.
-            return opname == "="
-                && super::exec::const_datum_for_column(
-                    (*c).constvalue,
-                    (*c).consttype,
-                    (*var).vartype,
-                )
-                .is_some();
+            // It applies the filter exactly when `segment_eq_operands`
+            // accepts the qual; accepting anything else here would count
+            // every segment.
+            return super::exec::segment_eq_operands(node)
+                .is_some_and(|(v, _)| (*v).varattno == attno);
         }
 
         // Time column: accept range bounds.  Reject equality — a row

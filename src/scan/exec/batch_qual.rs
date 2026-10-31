@@ -92,15 +92,22 @@ pub(in crate::scan) fn is_text_type(type_oid: pg_sys::Oid) -> bool {
 /// Batch filters, colstats/bloom pruning and segment/time-range pruning all
 /// read a pushed-down constant with the column's representation, so a
 /// constant of another type has to be converted first. Only exact
-/// conversions are done: the same type, or an integer constant that fits the
-/// integer column type. For anything else the caller leaves the qual to
-/// PostgreSQL and prunes nothing on it.
+/// conversions are done: the same type, `text` and `varchar` (one
+/// representation, and a varchar column is compared through the text
+/// operators), or an integer constant that fits the integer column type. For
+/// anything else the caller leaves the qual to PostgreSQL and prunes nothing
+/// on it.
 pub(in crate::scan) fn const_datum_for_column(
     datum: pg_sys::Datum,
     const_type: pg_sys::Oid,
     col_type: pg_sys::Oid,
 ) -> Option<pg_sys::Datum> {
-    if const_type == col_type {
+    if const_type == col_type
+        || matches!(
+            (const_type, col_type),
+            (pg_sys::TEXTOID, pg_sys::VARCHAROID) | (pg_sys::VARCHAROID, pg_sys::TEXTOID)
+        )
+    {
         return Some(datum);
     }
     let value = match const_type {
@@ -114,6 +121,61 @@ pub(in crate::scan) fn const_datum_for_column(
         pg_sys::INT4OID => i32::try_from(value).ok().map(pg_sys::Datum::from),
         pg_sys::INT8OID => Some(pg_sys::Datum::from(value)),
         _ => None,
+    }
+}
+
+/// The operands of a `col = const` that segment_by pruning applies: the
+/// column's `Var` (also under a `RelabelType`, as a varchar column is) and the
+/// constant as a datum of the column's type. `None` for any other qual.
+///
+/// On a segment_by column, `extract_segment_filters` turns this qual into a
+/// segment filter, so every row of a surviving segment satisfies it. Nothing
+/// evaluates any other text qual on a segment_by column in the serial
+/// DeltaXAgg or in the row path (the column is materialised from the segment
+/// value, and text quals run while text blobs are decompressed). The
+/// DeltaXAgg gate, `classify_meta_qual_node` and `extract_batch_quals`
+/// therefore accept a qual on a segment_by text column only when this
+/// returns `Some`.
+pub(in crate::scan) unsafe fn segment_eq_operands(
+    node: *const pg_sys::Node,
+) -> Option<(*const pg_sys::Var, pg_sys::Datum)> {
+    unsafe {
+        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_OpExpr {
+            return None;
+        }
+        let opexpr = node as *const pg_sys::OpExpr;
+        let args = (*opexpr).args;
+        if args.is_null() || (*args).length != 2 {
+            return None;
+        }
+        let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+        if opname_ptr.is_null() || std::ffi::CStr::from_ptr(opname_ptr).to_bytes() != b"=" {
+            return None;
+        }
+        let unwrap = |n: *const pg_sys::Node| -> *const pg_sys::Node {
+            if !n.is_null() && (*n).type_ == pg_sys::NodeTag::T_RelabelType {
+                (*(n as *const pg_sys::RelabelType)).arg as *const pg_sys::Node
+            } else {
+                n
+            }
+        };
+        let a0 = unwrap((*(*args).elements.add(0)).ptr_value as *const pg_sys::Node);
+        let a1 = unwrap((*(*args).elements.add(1)).ptr_value as *const pg_sys::Node);
+        if a0.is_null() || a1.is_null() {
+            return None;
+        }
+        let (var, c) = match ((*a0).type_, (*a1).type_) {
+            (pg_sys::NodeTag::T_Var, pg_sys::NodeTag::T_Const) => (a0, a1),
+            (pg_sys::NodeTag::T_Const, pg_sys::NodeTag::T_Var) => (a1, a0),
+            _ => return None,
+        };
+        let var = var as *const pg_sys::Var;
+        let c = c as *const pg_sys::Const;
+        if (*c).constisnull {
+            return None;
+        }
+        let value = const_datum_for_column((*c).constvalue, (*c).consttype, (*var).vartype)?;
+        Some((var, value))
     }
 }
 

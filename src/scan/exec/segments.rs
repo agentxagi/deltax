@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use super::batch_qual::{
-    BatchCompareOp, BatchQual, LikeStrategy, const_datum_for_column, sql_like_match,
+    BatchCompareOp, BatchQual, LikeStrategy, segment_eq_operands, sql_like_match,
 };
 use super::datum_utils::tupdesc_get_attr;
 use crate::compress::{encode_f32_to_i64, encode_f64_to_i64};
@@ -3940,6 +3940,29 @@ pub(super) unsafe fn extract_segment_filters(
                 continue;
             }
 
+            // segment_by equality filter: `segment_eq_operands` also reaches a
+            // varchar column, which is compared under a RelabelType to text.
+            if let Some((var, value)) = segment_eq_operands(node) {
+                let varattno = (*var).varattno as i32;
+                if varattno >= 1
+                    && varattno as usize <= col_names.len()
+                    && let Some(&sv_idx) =
+                        seg_val_index_map.get(col_names[(varattno - 1) as usize].as_str())
+                {
+                    // Render the constant as a value of the column's type —
+                    // the way segment_values are stored.
+                    let mut typoutput: pg_sys::Oid = pg_sys::InvalidOid;
+                    let mut typisvarlena: bool = false;
+                    pg_sys::getTypeOutputInfo((*var).vartype, &mut typoutput, &mut typisvarlena);
+                    let cstr = pg_sys::OidOutputFunctionCall(typoutput, value);
+                    let s = std::ffi::CStr::from_ptr(cstr)
+                        .to_string_lossy()
+                        .into_owned();
+                    pg_sys::pfree(cstr as *mut _);
+                    segment_by_filters.push((sv_idx, s));
+                }
+            }
+
             let opexpr = node as *const pg_sys::OpExpr;
             let args = (*opexpr).args;
             if args.is_null() || (*args).length != 2 {
@@ -3992,28 +4015,6 @@ pub(super) unsafe fn extract_segment_filters(
             }
             let col_idx = (varattno - 1) as usize;
             let col_name = &col_names[col_idx];
-
-            // Check if this is a segment_by equality filter
-            if opname == "="
-                && let Some(&sv_idx) = seg_val_index_map.get(col_name.as_str())
-                && let Some(value) = const_datum_for_column(
-                    (*const_node).constvalue,
-                    (*const_node).consttype,
-                    (*var_node).vartype,
-                )
-            {
-                // Render the constant as a value of the column's type — the
-                // way segment_values are stored.
-                let mut typoutput: pg_sys::Oid = pg_sys::InvalidOid;
-                let mut typisvarlena: bool = false;
-                pg_sys::getTypeOutputInfo((*var_node).vartype, &mut typoutput, &mut typisvarlena);
-                let cstr = pg_sys::OidOutputFunctionCall(typoutput, value);
-                let s = std::ffi::CStr::from_ptr(cstr)
-                    .to_string_lossy()
-                    .into_owned();
-                pg_sys::pfree(cstr as *mut _);
-                segment_by_filters.push((sv_idx, s));
-            }
 
             // Check if this is a time column range filter. The bound is read
             // as a datum of the column's type, so a constant of another type
