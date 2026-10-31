@@ -4,7 +4,9 @@ use pgrx::pg_sys;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use super::batch_qual::{BatchCompareOp, BatchQual, LikeStrategy, sql_like_match};
+use super::batch_qual::{
+    BatchCompareOp, BatchQual, LikeStrategy, const_datum_for_column, sql_like_match,
+};
 use super::datum_utils::tupdesc_get_attr;
 use crate::compress::{encode_f32_to_i64, encode_f64_to_i64};
 use crate::compression;
@@ -3994,16 +3996,18 @@ pub(super) unsafe fn extract_segment_filters(
             // Check if this is a segment_by equality filter
             if opname == "="
                 && let Some(&sv_idx) = seg_val_index_map.get(col_name.as_str())
+                && let Some(value) = const_datum_for_column(
+                    (*const_node).constvalue,
+                    (*const_node).consttype,
+                    (*var_node).vartype,
+                )
             {
-                // Extract const value as string (matches how segment_values are stored)
+                // Render the constant as a value of the column's type — the
+                // way segment_values are stored.
                 let mut typoutput: pg_sys::Oid = pg_sys::InvalidOid;
                 let mut typisvarlena: bool = false;
-                pg_sys::getTypeOutputInfo(
-                    (*const_node).consttype,
-                    &mut typoutput,
-                    &mut typisvarlena,
-                );
-                let cstr = pg_sys::OidOutputFunctionCall(typoutput, (*const_node).constvalue);
+                pg_sys::getTypeOutputInfo((*var_node).vartype, &mut typoutput, &mut typisvarlena);
+                let cstr = pg_sys::OidOutputFunctionCall(typoutput, value);
                 let s = std::ffi::CStr::from_ptr(cstr)
                     .to_string_lossy()
                     .into_owned();
@@ -4011,8 +4015,11 @@ pub(super) unsafe fn extract_segment_filters(
                 segment_by_filters.push((sv_idx, s));
             }
 
-            // Check if this is a time column range filter
-            if col_name == time_column {
+            // Check if this is a time column range filter. The bound is read
+            // as a datum of the column's type, so a constant of another type
+            // (`ts < DATE '...'`: a day count taken for microseconds) must
+            // not prune.
+            if col_name == time_column && (*const_node).consttype == (*var_node).vartype {
                 let ts_val = (*const_node).constvalue.value() as i64;
 
                 // Normalize operator direction (if Var is on right, flip the operator)

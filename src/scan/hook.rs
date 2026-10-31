@@ -977,12 +977,26 @@ unsafe fn classify_meta_qual_node(
         }
         let opname = std::ffi::CStr::from_ptr(opname_ptr).to_string_lossy();
 
+        let c = const_node as *const pg_sys::Const;
+        if (*c).constisnull {
+            return false;
+        }
+
         if is_seg {
             // Segment-by: equality only — `extract_segment_filters`
             // only matches `=`, and equality on segment_by is safe
             // because segmentation partitions rows along that value
             // (every row in a surviving segment satisfies the eq).
-            return opname == "=";
+            // It applies the filter only to a constant that converts
+            // exactly to the column's type (`const_datum_for_column`);
+            // accepting any other constant here would count every segment.
+            return opname == "="
+                && super::exec::const_datum_for_column(
+                    (*c).constvalue,
+                    (*c).consttype,
+                    (*var).vartype,
+                )
+                .is_some();
         }
 
         // Time column: accept range bounds.  Reject equality — a row
@@ -990,8 +1004,13 @@ unsafe fn classify_meta_qual_node(
         // segment (with ts≠C) don't; segment aggregates would overcount.
         // Safety of range bounds is enforced separately by
         // `partitions_contain_time_range` (see hook call site).
-        let c = const_node as *const pg_sys::Const;
-        if (*c).constisnull {
+        //
+        // Only a constant of the column's own type: `ts < DATE '...'` or
+        // `ts < TIMESTAMP '...'` on a timestamptz column compares through a
+        // cross-type operator that converts in the session time zone, which
+        // the bounds below would ignore, and `extract_segment_filters` does
+        // not prune on it either.
+        if (*c).consttype != (*var).vartype {
             return false;
         }
         if !matches!(
@@ -2764,6 +2783,9 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             if !var_on_left {
                                 return;
                             }
+                            if !super::exec::is_text_type((*const_node).consttype) {
+                                return; // e.g. `text = name`: not pushed
+                            }
                         } else {
                             // Numeric/date/bool comparison — check type is supported
                             if !matches!(
@@ -2778,6 +2800,17 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                                     | pg_sys::TIMESTAMPOID
                                     | pg_sys::TIMESTAMPTZOID
                             ) {
+                                return;
+                            }
+                            // A constant of another type is pushed only when
+                            // it converts exactly to the column's type.
+                            if super::exec::const_datum_for_column(
+                                (*const_node).constvalue,
+                                (*const_node).consttype,
+                                type_oid,
+                            )
+                            .is_none()
+                            {
                                 return;
                             }
                         }

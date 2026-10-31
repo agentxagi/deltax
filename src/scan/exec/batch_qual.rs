@@ -76,11 +76,45 @@ pub(super) fn is_batch_comparable_type(type_oid: pg_sys::Oid) -> bool {
     )
 }
 
-pub(super) fn is_text_type(type_oid: pg_sys::Oid) -> bool {
+pub(in crate::scan) fn is_text_type(type_oid: pg_sys::Oid) -> bool {
     matches!(
         type_oid,
         pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID
     )
+}
+
+/// A comparison constant as a datum of the column's own type, or `None` when
+/// it cannot be converted exactly.
+///
+/// PostgreSQL does not cast the constant of a mixed-type comparison: it picks
+/// a cross-type operator (`timestamptz < date`, `int2 < int4`,
+/// `float4 > float8`, `text = name`) and leaves the constant in its own type.
+/// Batch filters, colstats/bloom pruning and segment/time-range pruning all
+/// read a pushed-down constant with the column's representation, so a
+/// constant of another type has to be converted first. Only exact
+/// conversions are done: the same type, or an integer constant that fits the
+/// integer column type. For anything else the caller leaves the qual to
+/// PostgreSQL and prunes nothing on it.
+pub(in crate::scan) fn const_datum_for_column(
+    datum: pg_sys::Datum,
+    const_type: pg_sys::Oid,
+    col_type: pg_sys::Oid,
+) -> Option<pg_sys::Datum> {
+    if const_type == col_type {
+        return Some(datum);
+    }
+    let value = match const_type {
+        pg_sys::INT2OID => datum.value() as i16 as i64,
+        pg_sys::INT4OID => datum.value() as i32 as i64,
+        pg_sys::INT8OID => datum.value() as i64,
+        _ => return None,
+    };
+    match col_type {
+        pg_sys::INT2OID => i16::try_from(value).ok().map(pg_sys::Datum::from),
+        pg_sys::INT4OID => i32::try_from(value).ok().map(pg_sys::Datum::from),
+        pg_sys::INT8OID => Some(pg_sys::Datum::from(value)),
+        _ => None,
+    }
 }
 
 /// The constant list of a pushable IN-list, as an `InList` batch qual holds it.
@@ -99,7 +133,9 @@ pub(in crate::scan) enum InListValues {
 /// Only `useOr` with the `=` operator is an IN-list. `< ANY`, `> ANY`,
 /// `<> ANY` and every `ALL` form test something else; read as an IN-list
 /// they kept only the rows equal to an element. The array has to be a
-/// non-null, one-dimensional constant with no NULL element.
+/// non-null, one-dimensional constant with no NULL element, whose elements
+/// convert exactly to the column type (`const_datum_for_column`; any text
+/// type for a text column).
 pub(in crate::scan) unsafe fn in_list_values(
     saop: *const pg_sys::ScalarArrayOpExpr,
     col_type: pg_sys::Oid,
@@ -143,6 +179,9 @@ pub(in crate::scan) unsafe fn in_list_values(
             return None; // only 1-D arrays
         }
         let sa_elem_type = (*array_ptr).elemtype;
+        if is_text_in && !is_text_type(sa_elem_type) {
+            return None;
+        }
         let mut sa_elems: *mut pg_sys::Datum = std::ptr::null_mut();
         let mut sa_nulls: *mut bool = std::ptr::null_mut();
         let mut sa_nelems: i32 = 0;
@@ -185,6 +224,7 @@ pub(in crate::scan) unsafe fn in_list_values(
                 // bail rather than guess
                 in_values_text.push(std::str::from_utf8(bytes).ok()?.to_string());
             } else {
+                let datum = const_datum_for_column(datum, sa_elem_type, col_type)?;
                 in_values_i64.push(datum.value() as i64);
             }
         }
@@ -797,6 +837,11 @@ pub(super) unsafe fn extract_batch_quals(
                 if !var_on_left {
                     continue;
                 }
+                // `text = name` resolves to a cross-type operator: a `name`
+                // constant is not a varlena and cannot be read as text.
+                if !is_text_type((*const_node).consttype) {
+                    continue;
+                }
                 let varlena_ptr = (*const_node).constvalue.cast_mut_ptr::<pg_sys::varlena>();
                 let len = pgrx::varsize_any_exhdr(varlena_ptr);
                 let data = pgrx::vardata_any(varlena_ptr);
@@ -819,6 +864,15 @@ pub(super) unsafe fn extract_batch_quals(
                 if !is_batch_comparable_type(type_oid) {
                     continue;
                 }
+                // The filters and the pruning read the constant as a value of
+                // the column's type.
+                let Some(const_datum) = const_datum_for_column(
+                    (*const_node).constvalue,
+                    (*const_node).consttype,
+                    type_oid,
+                ) else {
+                    continue;
+                };
 
                 let op = if var_on_left {
                     cmp_op
@@ -829,7 +883,7 @@ pub(super) unsafe fn extract_batch_quals(
                 batch_quals.push(BatchQual {
                     col_idx,
                     op,
-                    const_datum: (*const_node).constvalue,
+                    const_datum,
                     type_oid,
                     ..Default::default()
                 });
