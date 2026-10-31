@@ -3817,7 +3817,20 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 if (*const_node).constisnull {
                     return;
                 }
-                let const_val = (*const_node).constvalue.value() as i64;
+                // DeltaXAgg reads the finalized aggregate as an i64 and
+                // compares it with this constant: exact only for an int4 or
+                // int8 aggregate against an integer constant. Anything else
+                // (avg and numeric sums, floats, timestamps, a numeric or
+                // float constant) is left to PostgreSQL.
+                if !matches!((*aggref_node).aggtype, pg_sys::INT4OID | pg_sys::INT8OID) {
+                    return;
+                }
+                let const_val: i64 = match (*const_node).consttype {
+                    pg_sys::INT2OID => (*const_node).constvalue.value() as i16 as i64,
+                    pg_sys::INT4OID => (*const_node).constvalue.value() as i32 as i64,
+                    pg_sys::INT8OID => (*const_node).constvalue.value() as i64,
+                    _ => return,
+                };
 
                 // Match the Aggref to a classified agg by position.
                 // Walk aggrefs in order and find which one matches this HAVING aggref.
