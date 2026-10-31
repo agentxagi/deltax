@@ -24,6 +24,15 @@
 //! 3. `count(*) FILTER (WHERE ...)` as the only aggregate took the
 //!    `DeltaXCount` fast path, which answers from catalog/segment row counts
 //!    and ignores the FILTER (it returned every row of the tenant).
+//! 4. Bloom probes hashed the PostgreSQL-epoch datum of a timestamp/date
+//!    constant while the filters were built from Unix-epoch values, so every
+//!    segment was bloom-rejected: `created_at = <exact ts>` and `IN (...)`
+//!    returned zero rows. The colstats min/max check for timestamp/date
+//!    IN-lists had the same epoch mix-up.
+//! 5. The time column's `_min_`/`_max_` from the meta table went into
+//!    `ColMinMax` in the PostgreSQL epoch, while its readers decode the
+//!    Unix-epoch colstats encoding: the metadata-only `min()`/`max()` of the
+//!    time column came back 30 years early.
 
 #[pgrx::pg_schema]
 mod tests {
@@ -83,7 +92,8 @@ mod tests {
                  tenant_id  text        NOT NULL,
                  created_at timestamptz NOT NULL,
                  channel    text,
-                 operation  text
+                 operation  text,
+                 logged_on  date
              )");
         run("SELECT deltax.deltax_create_table('fb0256_events', 'created_at', '1 day'::interval)");
         run("INSERT INTO fb0256_events
@@ -92,13 +102,15 @@ mod tests {
                     CASE WHEN (i / 40) % 2 = 0 THEN 'mcp' ELSE 'rest' END,
                     CASE i % 40 WHEN 0 THEN 'memory_used'
                                 WHEN 1 THEN 'upsert_keyed_fact'
-                                ELSE 'op' || lpad((i % 40)::text, 2, '0') END
+                                ELSE 'op' || lpad((i % 40)::text, 2, '0') END,
+                    DATE '2025-01-15'
                FROM generate_series(1, 800) i");
         run(&format!(
             "INSERT INTO fb0256_events
              SELECT 1000 + i, 'small-' || (i % 3),
                     '2025-01-15 06:00:00+00'::timestamptz + i * interval '1 second',
-                    'rest', ({SMALL_OPS_SQL})[1 + 2 * (i % 3) + (i / 3) % 2]
+                    'rest', ({SMALL_OPS_SQL})[1 + 2 * (i % 3) + (i / 3) % 2],
+                    DATE '2025-01-15'
                FROM generate_series(1, 300) i"
         ));
         run("CREATE TABLE fb0256_ref AS SELECT * FROM fb0256_events");
@@ -214,6 +226,63 @@ mod tests {
         ] {
             assert_eq!(assert_count_matches(pred), 50, "count(*) WHERE {pred}");
         }
+    }
+
+    #[pg_test]
+    fn temporal_equality_and_in_list_match() {
+        setup();
+
+        // Rows sit at 06:00:00 + i seconds (i from 1): one big-tenant row and
+        // one small-tenant row per second for the first 300 seconds.
+        assert_eq!(
+            assert_count_matches("created_at = '2025-01-15 06:00:01+00'"),
+            2
+        );
+        assert_eq!(
+            assert_count_matches(
+                "created_at IN ('2025-01-15 06:00:01+00', '2025-01-15 06:05:00+00')"
+            ),
+            4
+        );
+        assert_count_matches("tenant_id = 'big' AND created_at = '2025-01-15 06:00:40+00'");
+        // A date column that is not the partitioning column: bloom on `=`,
+        // colstats min/max on IN.
+        assert_eq!(assert_count_matches("logged_on = '2025-01-15'"), 1100);
+        assert_eq!(
+            assert_count_matches("logged_on IN ('2025-01-15', '2025-01-16')"),
+            1100
+        );
+        assert_count_matches("logged_on = '2025-01-16'");
+    }
+
+    #[pg_test]
+    fn temporal_min_max_from_metadata_matches() {
+        setup();
+
+        // Over the whole compressed day, DeltaXMinMax answers from the meta
+        // table. The meta keeps the time column's `_min_`/`_max_` in the
+        // PostgreSQL epoch, and they were decoded as Unix-epoch colstats
+        // values: the result came back 30 years early (in ValorBrain
+        // production, 1996-08-04 for a 2026-08-04 row of usage_events).
+        let min_max = |table: &str| {
+            format!(
+                "SELECT m.lo::text || ' / ' || m.hi::text
+                   FROM (SELECT min(created_at) AS lo, max(created_at) AS hi
+                           FROM {table}
+                          WHERE created_at >= '2025-01-15 00:00:00+00'
+                            AND created_at < '2025-01-16 00:00:00+00') m"
+            )
+        };
+        let plan = explain(&min_max("fb0256_events"));
+        assert!(
+            plan.contains("DeltaXMinMax"),
+            "expected DeltaXMinMax, got:\n{plan}"
+        );
+        assert_eq!(
+            one_text(&min_max("fb0256_events")),
+            one_text(&min_max("fb0256_ref")),
+            "min/max(created_at) from the compressed partition"
+        );
     }
 
     #[pg_test]
