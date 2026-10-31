@@ -33,6 +33,19 @@
 //!    `ColMinMax` in the PostgreSQL epoch, while its readers decode the
 //!    Unix-epoch colstats encoding: the metadata-only `min()`/`max()` of the
 //!    time column came back 30 years early.
+//!
+//! FB-0275 (independent review, 2026-10-31):
+//!
+//! 6. `col op ANY(array)` was pushed down as `col IN (...)` whatever the
+//!    operator: `id < ANY(ARRAY[100, 1200])` kept only the rows equal to an
+//!    element. The DeltaXAgg planner gate also accepted IN-lists the executor
+//!    does not push (a NULL element, an empty or a two-dimensional array),
+//!    and the WHERE was dropped.
+//! 7. A constant of another type was read as if it had the column's type:
+//!    `created_at < DATE '2025-01-16'` took a day count for microseconds and
+//!    pruned every segment (0 rows instead of 1100), a `smallint` compared
+//!    with 65539 used the truncated constant 3, a `float8` constant was read
+//!    as a `float4` and a `name` as `text`.
 
 #[pgrx::pg_schema]
 mod tests {
@@ -93,7 +106,9 @@ mod tests {
                  created_at timestamptz NOT NULL,
                  channel    text,
                  operation  text,
-                 logged_on  date
+                 logged_on  date,
+                 kind       smallint,
+                 score      real
              )");
         run("SELECT deltax.deltax_create_table('fb0256_events', 'created_at', '1 day'::interval)");
         run("INSERT INTO fb0256_events
@@ -103,14 +118,14 @@ mod tests {
                     CASE i % 40 WHEN 0 THEN 'memory_used'
                                 WHEN 1 THEN 'upsert_keyed_fact'
                                 ELSE 'op' || lpad((i % 40)::text, 2, '0') END,
-                    DATE '2025-01-15'
+                    DATE '2025-01-15', i % 5, i / 10.0
                FROM generate_series(1, 800) i");
         run(&format!(
             "INSERT INTO fb0256_events
              SELECT 1000 + i, 'small-' || (i % 3),
                     '2025-01-15 06:00:00+00'::timestamptz + i * interval '1 second',
                     'rest', ({SMALL_OPS_SQL})[1 + 2 * (i % 3) + (i / 3) % 2],
-                    DATE '2025-01-15'
+                    DATE '2025-01-15', i % 5, i / 10.0
                FROM generate_series(1, 300) i"
         ));
         run("CREATE TABLE fb0256_ref AS SELECT * FROM fb0256_events");
@@ -163,6 +178,37 @@ mod tests {
         let want = one_i64(&format!("SELECT count(*) FROM fb0256_ref WHERE {pred}"));
         assert_eq!(got, want, "count(*) WHERE {pred}");
         got
+    }
+
+    /// `count(id)` and the ids with `pred` on the compressed table equal the
+    /// oracle. The count goes through the aggregate paths that accept the
+    /// WHERE (DeltaXAgg, the metadata-only DeltaXMinMax), the ids through the
+    /// row path (DeltaXAppend). `id` is NOT NULL, so `count(id)` is the row
+    /// count; `count(*)` over a plain DeltaX row scan projects an empty target
+    /// list, which trips an assertion of cassert builds of PostgreSQL 18 (a
+    /// separate defect).
+    fn assert_rows_match(pred: &str) -> i64 {
+        let count = |t: &str| one_i64(&format!("SELECT count(id) FROM {t} WHERE {pred}"));
+        let got = count("fb0256_events");
+        assert_eq!(got, count("fb0256_ref"), "count(id) WHERE {pred}");
+        let ids = |t: &str| {
+            one_text(&format!(
+                "SELECT string_agg(id::text, ',' ORDER BY id) FROM (
+                     SELECT id FROM {t} WHERE {pred} ORDER BY id LIMIT 2000) s"
+            ))
+        };
+        assert_eq!(ids("fb0256_events"), ids("fb0256_ref"), "rows WHERE {pred}");
+        got
+    }
+
+    /// `count(id)` with `pred` is answered by DeltaXAgg: the qual is still
+    /// pushed down.
+    fn assert_pushed_to_agg(pred: &str) {
+        let plan = explain(&format!("SELECT count(id) FROM fb0256_events WHERE {pred}"));
+        assert!(
+            plan.contains("DeltaXAgg"),
+            "WHERE {pred}: expected DeltaXAgg, got:\n{plan}"
+        );
     }
 
     #[pg_test]
@@ -312,5 +358,140 @@ mod tests {
             plan.contains("DeltaXCount"),
             "expected DeltaXCount, got:\n{plan}"
         );
+    }
+
+    #[pg_test]
+    fn any_all_with_other_operators_match() {
+        setup();
+
+        // `op ANY (array)` holds when `op` holds for some element, `op ALL`
+        // when it holds for every element. Only `= ANY` is an IN-list.
+        for (pred, want) in [
+            ("id < ANY(ARRAY[100, 1200]::int8[])", 999),
+            ("id > ANY(ARRAY[100, 1200]::int8[])", 1000),
+            ("id <> ANY(ARRAY[100, 1200]::int8[])", 1100),
+            (
+                "tenant_id = 'big' AND id < ANY(ARRAY[100, 1200]::int8[])",
+                800,
+            ),
+            ("id < ALL(ARRAY[100, 1200]::int8[])", 99),
+            ("id > ALL(ARRAY[100, 1200]::int8[])", 100),
+            ("id <> ALL(ARRAY[100, 1200]::int8[])", 1098),
+            ("operation <> ANY(ARRAY['memory_used'])", 1080),
+            ("operation <> ALL(ARRAY['memory_used', 'op02'])", 1060),
+            (
+                "created_at < ANY(ARRAY['2025-01-15 06:01:00+00',
+                                        '2025-01-15 06:02:00+00']::timestamptz[])",
+                238,
+            ),
+            (
+                "created_at > ALL(ARRAY['2025-01-15 06:01:00+00',
+                                        '2025-01-15 06:02:00+00']::timestamptz[])",
+                860,
+            ),
+            ("logged_on <> ANY(ARRAY['2025-01-16']::date[])", 1100),
+            // IN-lists the executor does not push (a NULL element, an empty
+            // or a two-dimensional array) must not reach DeltaXAgg either.
+            ("id IN (5, NULL)", 1),
+            ("operation IN ('memory_used', NULL)", 20),
+            ("id = ANY('{}'::int8[])", 0),
+            ("id = ANY('{{5, 1005}, {6, 1006}}'::int8[])", 4),
+            // Controls: plain IN-lists.
+            ("id IN (5, 1005)", 2),
+            ("operation IN ('memory_used', 'GET /documents')", 70),
+        ] {
+            assert_eq!(assert_rows_match(pred), want, "count(id) WHERE {pred}");
+        }
+        // Text order depends on the collation; the oracle uses the same one.
+        for pred in [
+            "operation < ANY(ARRAY['b', 'op10'])",
+            "operation > ANY(ARRAY['op30'])",
+            "operation >= ALL(ARRAY['op10', 'op20'])",
+        ] {
+            assert_rows_match(pred);
+        }
+        // `= ANY` keeps its pushdown.
+        assert_pushed_to_agg("id IN (5, 1005)");
+        assert_pushed_to_agg("operation IN ('memory_used', 'GET /documents')");
+    }
+
+    #[pg_test]
+    fn temporal_constants_of_another_type_match() {
+        setup();
+        // Cross-type temporal comparisons convert in the session time zone;
+        // outside UTC the raw datums of the two types are hours apart.
+        run("SET LOCAL timezone = 'America/Sao_Paulo'");
+
+        for (pred, want) in [
+            // timestamptz column, date and timestamp constants. Rows sit at
+            // 2025-01-15 06:00:01+00 .. 06:13:20+00.
+            ("created_at < DATE '2025-01-16'", 1100),
+            ("created_at >= DATE '2025-01-15'", 1100),
+            ("created_at < DATE '2025-01-15'", 0),
+            ("created_at < TIMESTAMP '2025-01-15 03:05:00'", 598),
+            ("created_at = TIMESTAMP '2025-01-15 03:00:01'", 2),
+            // date column, timestamptz and timestamp constants.
+            ("logged_on < TIMESTAMPTZ '2025-01-16 00:00:00+00'", 1100),
+            ("logged_on >= TIMESTAMPTZ '2025-01-15 12:00:00+00'", 0),
+            ("logged_on = TIMESTAMP '2025-01-15 00:00:00'", 1100),
+            // Controls: constants of the column's own type.
+            ("created_at < '2025-01-15 06:05:00+00'", 598),
+            ("logged_on = DATE '2025-01-15'", 1100),
+        ] {
+            assert_eq!(assert_rows_match(pred), want, "count(id) WHERE {pred}");
+        }
+        assert_pushed_to_agg("created_at < '2025-01-15 06:05:00+00' AND tenant_id = 'big'");
+    }
+
+    #[pg_test]
+    fn numeric_constants_of_another_type_match() {
+        setup();
+
+        for (pred, want) in [
+            // smallint column (values 0..4), int4 constants outside its range:
+            // truncated to int16 they became 3, 1 and 1.
+            ("kind < 65539", 1100),
+            ("kind <> 65537", 1100),
+            ("kind > -65535", 1100),
+            ("kind = 65537", 0),
+            // real column (i / 10), float8 constants.
+            ("score > 1", 1080),
+            ("score < 50.5", 804),
+            ("score = 0.5", 2),
+            // Controls: integer constants that fit the column, of the same or
+            // of another integer type, stay pushed down.
+            ("id = 5", 1),
+            ("id < 100", 99),
+            ("id = ANY(ARRAY[5, 1005])", 2),
+            ("kind = 1", 220),
+            ("kind IN (1, 2)", 440),
+        ] {
+            assert_eq!(assert_rows_match(pred), want, "count(id) WHERE {pred}");
+        }
+        for pred in [
+            "id = 5",
+            "id = ANY(ARRAY[5, 1005])",
+            "kind = 1",
+            "kind IN (1, 2)",
+        ] {
+            assert_pushed_to_agg(pred);
+        }
+    }
+
+    #[pg_test]
+    fn text_constants_of_another_type_match() {
+        setup();
+
+        for (pred, want) in [
+            // `text = name` is a cross-type operator; a `name` is no varlena.
+            ("operation = 'memory_used'::name", 20),
+            ("operation = ANY(ARRAY['memory_used']::name[])", 20),
+            // segment_by: the executor applies the segment filter only to a
+            // constant of the column's type, so the metadata-only count must
+            // not take this one either (it would count every segment).
+            ("tenant_id = 'big'::name", 800),
+        ] {
+            assert_eq!(assert_rows_match(pred), want, "count(id) WHERE {pred}");
+        }
     }
 }
