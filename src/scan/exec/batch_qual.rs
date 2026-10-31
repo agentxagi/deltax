@@ -92,15 +92,22 @@ pub(in crate::scan) fn is_text_type(type_oid: pg_sys::Oid) -> bool {
 /// Batch filters, colstats/bloom pruning and segment/time-range pruning all
 /// read a pushed-down constant with the column's representation, so a
 /// constant of another type has to be converted first. Only exact
-/// conversions are done: the same type, or an integer constant that fits the
-/// integer column type. For anything else the caller leaves the qual to
-/// PostgreSQL and prunes nothing on it.
+/// conversions are done: the same type, `text` and `varchar` (one
+/// representation, and a varchar column is compared through the text
+/// operators), or an integer constant that fits the integer column type. For
+/// anything else the caller leaves the qual to PostgreSQL and prunes nothing
+/// on it.
 pub(in crate::scan) fn const_datum_for_column(
     datum: pg_sys::Datum,
     const_type: pg_sys::Oid,
     col_type: pg_sys::Oid,
 ) -> Option<pg_sys::Datum> {
-    if const_type == col_type {
+    if const_type == col_type
+        || matches!(
+            (const_type, col_type),
+            (pg_sys::TEXTOID, pg_sys::VARCHAROID) | (pg_sys::VARCHAROID, pg_sys::TEXTOID)
+        )
+    {
         return Some(datum);
     }
     let value = match const_type {
@@ -114,6 +121,61 @@ pub(in crate::scan) fn const_datum_for_column(
         pg_sys::INT4OID => i32::try_from(value).ok().map(pg_sys::Datum::from),
         pg_sys::INT8OID => Some(pg_sys::Datum::from(value)),
         _ => None,
+    }
+}
+
+/// The operands of a `col = const` that segment_by pruning applies: the
+/// column's `Var` (also under a `RelabelType`, as a varchar column is) and the
+/// constant as a datum of the column's type. `None` for any other qual.
+///
+/// On a segment_by column, `extract_segment_filters` turns this qual into a
+/// segment filter, so every row of a surviving segment satisfies it. Nothing
+/// evaluates any other text qual on a segment_by column in the serial
+/// DeltaXAgg or in the row path (the column is materialised from the segment
+/// value, and text quals run while text blobs are decompressed). The
+/// DeltaXAgg gate, `classify_meta_qual_node` and `extract_batch_quals`
+/// therefore accept a qual on a segment_by text column only when this
+/// returns `Some`.
+pub(in crate::scan) unsafe fn segment_eq_operands(
+    node: *const pg_sys::Node,
+) -> Option<(*const pg_sys::Var, pg_sys::Datum)> {
+    unsafe {
+        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_OpExpr {
+            return None;
+        }
+        let opexpr = node as *const pg_sys::OpExpr;
+        let args = (*opexpr).args;
+        if args.is_null() || (*args).length != 2 {
+            return None;
+        }
+        let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+        if opname_ptr.is_null() || std::ffi::CStr::from_ptr(opname_ptr).to_bytes() != b"=" {
+            return None;
+        }
+        let unwrap = |n: *const pg_sys::Node| -> *const pg_sys::Node {
+            if !n.is_null() && (*n).type_ == pg_sys::NodeTag::T_RelabelType {
+                (*(n as *const pg_sys::RelabelType)).arg as *const pg_sys::Node
+            } else {
+                n
+            }
+        };
+        let a0 = unwrap((*(*args).elements.add(0)).ptr_value as *const pg_sys::Node);
+        let a1 = unwrap((*(*args).elements.add(1)).ptr_value as *const pg_sys::Node);
+        if a0.is_null() || a1.is_null() {
+            return None;
+        }
+        let (var, c) = match ((*a0).type_, (*a1).type_) {
+            (pg_sys::NodeTag::T_Var, pg_sys::NodeTag::T_Const) => (a0, a1),
+            (pg_sys::NodeTag::T_Const, pg_sys::NodeTag::T_Var) => (a1, a0),
+            _ => return None,
+        };
+        let var = var as *const pg_sys::Var;
+        let c = c as *const pg_sys::Const;
+        if (*c).constisnull {
+            return None;
+        }
+        let value = const_datum_for_column((*c).constvalue, (*c).consttype, (*var).vartype)?;
+        Some((var, value))
     }
 }
 
@@ -173,8 +235,12 @@ pub(in crate::scan) unsafe fn in_list_values(
         if !is_numeric_in && !is_text_in {
             return None;
         }
-        // Deconstruct the array constant to extract element values
-        let array_ptr = (*sa_const).constvalue.cast_mut_ptr::<pg_sys::ArrayType>();
+        // Deconstruct the array constant to extract element values. Detoast
+        // first: the header of a compressed, external or short-header array
+        // is not an ArrayType.
+        let array_ptr =
+            pg_sys::pg_detoast_datum((*sa_const).constvalue.cast_mut_ptr::<pg_sys::varlena>())
+                as *mut pg_sys::ArrayType;
         if (*array_ptr).ndim != 1 {
             return None; // only 1-D arrays
         }
@@ -599,10 +665,15 @@ pub(super) fn evaluate_batch_quals(
 /// of qual list nodes that were successfully converted to batch quals. When
 /// `handled_count == list_length(qual_list)`, all quals are handled by batch
 /// evaluation and PG's per-row ExecQual can be skipped.
+///
+/// A text qual on a `segment_by` column is pushed only when it is the
+/// equality that segment pruning applies (`segment_eq_operands`); `<>`, LIKE,
+/// NOT LIKE and IN on such a column are left to PostgreSQL.
 pub(super) unsafe fn extract_batch_quals(
     qual_list: *mut pg_sys::List,
     col_names: &[String],
     col_types: &[pg_sys::Oid],
+    segment_by: &[String],
 ) -> (Vec<BatchQual>, usize) {
     let mut batch_quals = Vec::new();
 
@@ -697,6 +768,9 @@ pub(super) unsafe fn extract_batch_quals(
                 }
                 let sa_col_idx = (sa_varattno - 1) as usize;
                 let sa_type_oid = col_types[sa_col_idx];
+                if is_text_type(sa_type_oid) && segment_by.contains(&col_names[sa_col_idx]) {
+                    continue; // IN on a segment_by text column: see the doc comment
+                }
                 let (in_list_i64, in_list_text) = match in_list_values(saop, sa_type_oid) {
                     Some(InListValues::Numeric(values)) => (Some(values), None),
                     Some(InListValues::Text(values)) => (None, Some(values)),
@@ -809,6 +883,9 @@ pub(super) unsafe fn extract_batch_quals(
                 ) {
                     continue;
                 }
+                if segment_by.contains(&col_names[col_idx]) {
+                    continue; // LIKE on a segment_by column: see the doc comment
+                }
                 // Extract pattern string from constant datum
                 let varlena_ptr = (*const_node).constvalue.cast_mut_ptr::<pg_sys::varlena>();
                 let len = pgrx::varsize_any_exhdr(varlena_ptr);
@@ -840,6 +917,13 @@ pub(super) unsafe fn extract_batch_quals(
                 // `text = name` resolves to a cross-type operator: a `name`
                 // constant is not a varlena and cannot be read as text.
                 if !is_text_type((*const_node).consttype) {
+                    continue;
+                }
+                // On a segment_by column only the equality segment pruning
+                // applies is pushed: see the doc comment.
+                if segment_by.contains(&col_names[col_idx])
+                    && (cmp_op != BatchCompareOp::Eq || segment_eq_operands(node).is_none())
+                {
                     continue;
                 }
                 let varlena_ptr = (*const_node).constvalue.cast_mut_ptr::<pg_sys::varlena>();
@@ -1169,6 +1253,62 @@ mod tests {
         }
         for bad in [pg_sys::INT4OID, pg_sys::JSONBOID, pg_sys::BOOLOID] {
             assert!(!is_text_type(bad));
+        }
+    }
+
+    /// `in_list_values` decodes an array constant whatever its varlena form.
+    /// Here the array has a one-byte header, as a short value has on disk:
+    /// a valid datum, but its header is not an `ArrayType` until it is
+    /// detoasted. (`makeConst` detoasts, so SQL alone does not build one.)
+    #[pgrx::pg_test]
+    fn in_list_values_detoasts_the_array() {
+        unsafe {
+            let opno = pgrx::Spi::get_one::<i64>("SELECT '=(int8,int8)'::regoperator::oid::int8")
+                .unwrap()
+                .unwrap();
+            let opno = pg_sys::Oid::from(opno as u32);
+            let mut elems = [pg_sys::Datum::from(5i64), pg_sys::Datum::from(1005i64)];
+            let flat = pg_sys::construct_array_builtin(elems.as_mut_ptr(), 2, pg_sys::INT8OID);
+            let total = pgrx::varsize_any(flat as *const pg_sys::varlena);
+            let short_len = total - 4 + 1;
+            assert!(
+                short_len <= 0x7f,
+                "a one-byte header holds at most 127 bytes"
+            );
+            let short = pg_sys::palloc0(short_len) as *mut u8;
+            *short = ((short_len as u8) << 1) | 1;
+            std::ptr::copy_nonoverlapping((flat as *const u8).add(4), short.add(1), total - 4);
+
+            let in_list_over = |array: pg_sys::Datum| -> Option<Vec<i64>> {
+                let c = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
+                (*c).xpr.type_ = pg_sys::NodeTag::T_Const;
+                (*c).consttype = pg_sys::INT8ARRAYOID;
+                (*c).consttypmod = -1;
+                (*c).constlen = -1;
+                (*c).constvalue = array;
+                (*c).location = -1;
+                let saop = pg_sys::palloc0(std::mem::size_of::<pg_sys::ScalarArrayOpExpr>())
+                    as *mut pg_sys::ScalarArrayOpExpr;
+                (*saop).xpr.type_ = pg_sys::NodeTag::T_ScalarArrayOpExpr;
+                (*saop).opno = opno;
+                (*saop).useOr = true;
+                let args = pg_sys::lappend(std::ptr::null_mut(), c.cast());
+                (*saop).args = pg_sys::lappend(args, c.cast());
+                match in_list_values(saop, pg_sys::INT8OID) {
+                    Some(InListValues::Numeric(values)) => Some(values),
+                    _ => None,
+                }
+            };
+            assert_eq!(
+                in_list_over(pg_sys::Datum::from(flat)),
+                Some(vec![5, 1005]),
+                "flat array"
+            );
+            assert_eq!(
+                in_list_over(pg_sys::Datum::from(short)),
+                Some(vec![5, 1005]),
+                "one-byte-header array"
+            );
         }
     }
 }
