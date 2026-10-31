@@ -29,6 +29,10 @@
 //!    segment was bloom-rejected: `created_at = <exact ts>` and `IN (...)`
 //!    returned zero rows. The colstats min/max check for timestamp/date
 //!    IN-lists had the same epoch mix-up.
+//! 5. The time column's `_min_`/`_max_` from the meta table went into
+//!    `ColMinMax` in the PostgreSQL epoch, while its readers decode the
+//!    Unix-epoch colstats encoding: the metadata-only `min()`/`max()` of the
+//!    time column came back 30 years early.
 
 #[pgrx::pg_schema]
 mod tests {
@@ -249,6 +253,36 @@ mod tests {
             1100
         );
         assert_count_matches("logged_on = '2025-01-16'");
+    }
+
+    #[pg_test]
+    fn temporal_min_max_from_metadata_matches() {
+        setup();
+
+        // Over the whole compressed day, DeltaXMinMax answers from the meta
+        // table. The meta keeps the time column's `_min_`/`_max_` in the
+        // PostgreSQL epoch, and they were decoded as Unix-epoch colstats
+        // values: the result came back 30 years early (in ValorBrain
+        // production, 1996-08-04 for a 2026-08-04 row of usage_events).
+        let min_max = |table: &str| {
+            format!(
+                "SELECT m.lo::text || ' / ' || m.hi::text
+                   FROM (SELECT min(created_at) AS lo, max(created_at) AS hi
+                           FROM {table}
+                          WHERE created_at >= '2025-01-15 00:00:00+00'
+                            AND created_at < '2025-01-16 00:00:00+00') m"
+            )
+        };
+        let plan = explain(&min_max("fb0256_events"));
+        assert!(
+            plan.contains("DeltaXMinMax"),
+            "expected DeltaXMinMax, got:\n{plan}"
+        );
+        assert_eq!(
+            one_text(&min_max("fb0256_events")),
+            one_text(&min_max("fb0256_ref")),
+            "min/max(created_at) from the compressed partition"
+        );
     }
 
     #[pg_test]
