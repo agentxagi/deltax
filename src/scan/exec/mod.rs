@@ -22,6 +22,7 @@ pub(crate) use agg::{
     AggExpr, AggType, CaseWhenClause, CaseWhenCondition, CaseWhenOp, CaseWhenSpec, CaseWhenValue,
     GroupByColSpec, GroupByExpr, HavingFilter, HavingOp, OutputTransform,
 };
+pub(in crate::scan) use batch_qual::in_list_values;
 
 // Re-export for cost.rs (parallel-agg worker recommendation needs the slot cap).
 pub(crate) use agg::MAX_AGG_WORKER_SLOTS;

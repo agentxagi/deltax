@@ -2815,47 +2815,26 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         // Var or json_extract chain on the LHS; runtime
                         // (`extract_batch_quals` + per-segment text dispatch
                         // in `decompress.rs`) handles both numeric and text
-                        // IN lists, so the planner gate matches.
+                        // IN lists. The operator, the array and the column
+                        // type are checked by `in_list_values`, the same
+                        // function `extract_batch_quals` pushes through.
                         let saop = qn as *const pg_sys::ScalarArrayOpExpr;
-                        if !(*saop).useOr {
-                            return; // ALL semantics not supported
-                        }
                         let sa_args = (*saop).args;
                         if sa_args.is_null() || (*sa_args).length != 2 {
                             return;
                         }
                         let sa_arg0 =
                             (*(*sa_args).elements.add(0)).ptr_value as *const pg_sys::Node;
-                        let sa_arg1 =
-                            (*(*sa_args).elements.add(1)).ptr_value as *const pg_sys::Node;
-                        if sa_arg0.is_null() || sa_arg1.is_null() {
+                        if sa_arg0.is_null() {
                             return;
                         }
                         let sa_a0 = unwrap_relabel_node(sa_arg0);
-                        if (*sa_arg1).type_ != pg_sys::NodeTag::T_Const {
-                            return;
-                        }
-                        let sa_const = sa_arg1 as *const pg_sys::Const;
-                        if (*sa_const).constisnull {
-                            return;
-                        }
                         let Some(sa_type_oid) =
                             resolve_var_or_json_extract_type(root, sa_a0, &mut json_extract_ctx)
                         else {
                             return;
                         };
-                        if !matches!(
-                            sa_type_oid,
-                            pg_sys::INT2OID
-                                | pg_sys::INT4OID
-                                | pg_sys::INT8OID
-                                | pg_sys::DATEOID
-                                | pg_sys::TIMESTAMPOID
-                                | pg_sys::TIMESTAMPTZOID
-                                | pg_sys::TEXTOID
-                                | pg_sys::VARCHAROID
-                                | pg_sys::BPCHAROID
-                        ) {
+                        if super::exec::in_list_values(saop, sa_type_oid).is_none() {
                             return;
                         }
                     }

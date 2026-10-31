@@ -83,6 +83,119 @@ pub(super) fn is_text_type(type_oid: pg_sys::Oid) -> bool {
     )
 }
 
+/// The constant list of a pushable IN-list, as an `InList` batch qual holds it.
+pub(in crate::scan) enum InListValues {
+    /// Integer and temporal columns: the column-type datum of each element.
+    Numeric(Vec<i64>),
+    Text(Vec<String>),
+}
+
+/// Decode `col = ANY(<array constant>)` (what `col IN (...)` parses to) over
+/// a column of type `col_type` into the values of an `InList` batch qual, or
+/// `None` when the qual has to be left to PostgreSQL. The DeltaXAgg planner
+/// gate and `extract_batch_quals` both decide through this function: a qual
+/// the gate accepts but the executor does not push is silently dropped.
+///
+/// Only `useOr` with the `=` operator is an IN-list. `< ANY`, `> ANY`,
+/// `<> ANY` and every `ALL` form test something else; read as an IN-list
+/// they kept only the rows equal to an element. The array has to be a
+/// non-null, one-dimensional constant with no NULL element.
+pub(in crate::scan) unsafe fn in_list_values(
+    saop: *const pg_sys::ScalarArrayOpExpr,
+    col_type: pg_sys::Oid,
+) -> Option<InListValues> {
+    unsafe {
+        if !(*saop).useOr {
+            return None;
+        }
+        let opname_ptr = pg_sys::get_opname((*saop).opno);
+        if opname_ptr.is_null() || std::ffi::CStr::from_ptr(opname_ptr).to_bytes() != b"=" {
+            return None;
+        }
+        let sa_args = (*saop).args;
+        if sa_args.is_null() || (*sa_args).length != 2 {
+            return None;
+        }
+        let raw_arg1 = (*(*sa_args).elements.add(1)).ptr_value as *const pg_sys::Node;
+        if raw_arg1.is_null() || (*raw_arg1).type_ != pg_sys::NodeTag::T_Const {
+            return None;
+        }
+        let sa_const = raw_arg1 as *const pg_sys::Const;
+        if (*sa_const).constisnull {
+            return None;
+        }
+        let is_numeric_in = matches!(
+            col_type,
+            pg_sys::INT2OID
+                | pg_sys::INT4OID
+                | pg_sys::INT8OID
+                | pg_sys::DATEOID
+                | pg_sys::TIMESTAMPOID
+                | pg_sys::TIMESTAMPTZOID
+        );
+        let is_text_in = is_text_type(col_type);
+        if !is_numeric_in && !is_text_in {
+            return None;
+        }
+        // Deconstruct the array constant to extract element values
+        let array_ptr = (*sa_const).constvalue.cast_mut_ptr::<pg_sys::ArrayType>();
+        if (*array_ptr).ndim != 1 {
+            return None; // only 1-D arrays
+        }
+        let sa_elem_type = (*array_ptr).elemtype;
+        let mut sa_elems: *mut pg_sys::Datum = std::ptr::null_mut();
+        let mut sa_nulls: *mut bool = std::ptr::null_mut();
+        let mut sa_nelems: i32 = 0;
+        let mut sa_elem_len: i16 = 0;
+        let mut sa_elem_byval: bool = false;
+        let mut sa_elem_align: i8 = 0;
+        pg_sys::get_typlenbyvalalign(
+            sa_elem_type,
+            &mut sa_elem_len as *mut i16 as *mut _,
+            &mut sa_elem_byval,
+            &mut sa_elem_align as *mut i8 as *mut _,
+        );
+        pg_sys::deconstruct_array(
+            array_ptr,
+            sa_elem_type,
+            sa_elem_len as _,
+            sa_elem_byval,
+            sa_elem_align as _,
+            &mut sa_elems,
+            &mut sa_nulls,
+            &mut sa_nelems,
+        );
+        if sa_nelems <= 0 || sa_elems.is_null() {
+            return None;
+        }
+        // Collect values: i64 for numeric types, owned String for text.
+        let mut in_values_i64: Vec<i64> = Vec::new();
+        let mut in_values_text: Vec<String> = Vec::new();
+        for ei in 0..sa_nelems as usize {
+            if !sa_nulls.is_null() && *sa_nulls.add(ei) {
+                return None;
+            }
+            let datum = *sa_elems.add(ei);
+            if is_text_in {
+                let varlena_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
+                let len = pgrx::varsize_any_exhdr(varlena_ptr);
+                let data = pgrx::vardata_any(varlena_ptr);
+                #[allow(clippy::unnecessary_cast)]
+                let bytes = std::slice::from_raw_parts(data as *const u8, len);
+                // bail rather than guess
+                in_values_text.push(std::str::from_utf8(bytes).ok()?.to_string());
+            } else {
+                in_values_i64.push(datum.value() as i64);
+            }
+        }
+        Some(if is_text_in {
+            InListValues::Text(in_values_text)
+        } else {
+            InListValues::Numeric(in_values_i64)
+        })
+    }
+}
+
 /// Flip a comparison operator for `Const op Var` → `Var op Const` rewriting.
 pub(super) fn flip_compare_op(op: BatchCompareOp) -> BatchCompareOp {
     match op {
@@ -518,17 +631,12 @@ pub(super) unsafe fn extract_batch_quals(
             // Handle ScalarArrayOpExpr: col = ANY(ARRAY[...]) / col IN (...)
             if tag == pg_sys::NodeTag::T_ScalarArrayOpExpr {
                 let saop = node as *const pg_sys::ScalarArrayOpExpr;
-                // Only support OR semantics (IN), not AND (ALL)
-                if !(*saop).useOr {
-                    continue;
-                }
                 let sa_args = (*saop).args;
                 if sa_args.is_null() || (*sa_args).length != 2 {
                     continue;
                 }
                 let raw_arg0 = (*(*sa_args).elements.add(0)).ptr_value as *const pg_sys::Node;
-                let raw_arg1 = (*(*sa_args).elements.add(1)).ptr_value as *const pg_sys::Node;
-                if raw_arg0.is_null() || raw_arg1.is_null() {
+                if raw_arg0.is_null() {
                     continue;
                 }
                 // Unwrap RelabelType on the scalar side
@@ -538,118 +646,28 @@ pub(super) unsafe fn extract_batch_quals(
                 } else {
                     raw_arg0
                 };
-                // arg0 must be a Var, arg1 must be a Const (array)
+                // arg0 must be a Var; `in_list_values` checks the array side
                 if (*sa_a0).type_ != pg_sys::NodeTag::T_Var {
                     continue;
                 }
-                if (*raw_arg1).type_ != pg_sys::NodeTag::T_Const {
-                    continue;
-                }
                 let sa_var = sa_a0 as *const pg_sys::Var;
-                let sa_const = raw_arg1 as *const pg_sys::Const;
-                if (*sa_const).constisnull {
-                    continue;
-                }
                 let sa_varattno = (*sa_var).varattno as i32;
                 if sa_varattno < 1 || sa_varattno as usize > col_names.len() {
                     continue;
                 }
                 let sa_col_idx = (sa_varattno - 1) as usize;
                 let sa_type_oid = col_types[sa_col_idx];
-                let is_numeric_in = matches!(
-                    sa_type_oid,
-                    pg_sys::INT2OID
-                        | pg_sys::INT4OID
-                        | pg_sys::INT8OID
-                        | pg_sys::DATEOID
-                        | pg_sys::TIMESTAMPOID
-                        | pg_sys::TIMESTAMPTZOID
-                );
-                let is_text_in = matches!(
-                    sa_type_oid,
-                    pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID
-                );
-                if !is_numeric_in && !is_text_in {
-                    continue;
-                }
-                // Deconstruct the array constant to extract element values
-                let array_datum = (*sa_const).constvalue;
-                let array_ptr = array_datum.cast_mut_ptr::<pg_sys::ArrayType>();
-                let ndim = (*array_ptr).ndim;
-                if ndim != 1 {
-                    continue; // only 1-D arrays
-                }
-                let mut sa_elems: *mut pg_sys::Datum = std::ptr::null_mut();
-                let mut sa_nulls: *mut bool = std::ptr::null_mut();
-                let mut sa_nelems: i32 = 0;
-                // Get element type info for deconstruct_array
-                let sa_elem_type = (*array_ptr).elemtype;
-                let mut sa_elem_len: i16 = 0;
-                let mut sa_elem_byval: bool = false;
-                let mut sa_elem_align: i8 = 0;
-                pg_sys::get_typlenbyvalalign(
-                    sa_elem_type,
-                    &mut sa_elem_len as *mut i16 as *mut _,
-                    &mut sa_elem_byval,
-                    &mut sa_elem_align as *mut i8 as *mut _,
-                );
-                pg_sys::deconstruct_array(
-                    array_ptr,
-                    sa_elem_type,
-                    sa_elem_len as _,
-                    sa_elem_byval,
-                    sa_elem_align as _,
-                    &mut sa_elems,
-                    &mut sa_nulls,
-                    &mut sa_nelems,
-                );
-                if sa_nelems <= 0 || sa_elems.is_null() {
-                    continue;
-                }
-                // Collect values: i64 for numeric types, owned String for text.
-                let mut sa_has_null = false;
-                let mut in_values_i64: Vec<i64> = Vec::new();
-                let mut in_values_text: Vec<String> = Vec::new();
-                for ei in 0..sa_nelems as usize {
-                    if !sa_nulls.is_null() && *sa_nulls.add(ei) {
-                        sa_has_null = true;
-                        break;
-                    }
-                    let datum = *sa_elems.add(ei);
-                    if is_text_in {
-                        let varlena_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
-                        let len = pgrx::varsize_any_exhdr(varlena_ptr);
-                        let data = pgrx::vardata_any(varlena_ptr);
-                        #[allow(clippy::unnecessary_cast)]
-                        let bytes = std::slice::from_raw_parts(data as *const u8, len);
-                        match std::str::from_utf8(bytes) {
-                            Ok(s) => in_values_text.push(s.to_string()),
-                            Err(_) => {
-                                sa_has_null = true; // bail rather than guess
-                                break;
-                            }
-                        }
-                    } else {
-                        in_values_i64.push(datum.value() as i64);
-                    }
-                }
-                if sa_has_null {
-                    continue;
-                }
+                let (in_list_i64, in_list_text) = match in_list_values(saop, sa_type_oid) {
+                    Some(InListValues::Numeric(values)) => (Some(values), None),
+                    Some(InListValues::Text(values)) => (None, Some(values)),
+                    None => continue,
+                };
                 batch_quals.push(BatchQual {
                     col_idx: sa_col_idx,
                     op: BatchCompareOp::InList,
                     type_oid: sa_type_oid,
-                    in_list_i64: if is_numeric_in {
-                        Some(in_values_i64)
-                    } else {
-                        None
-                    },
-                    in_list_text: if is_text_in {
-                        Some(in_values_text)
-                    } else {
-                        None
-                    },
+                    in_list_i64,
+                    in_list_text,
                     ..Default::default()
                 });
                 continue;
