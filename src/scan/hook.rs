@@ -987,16 +987,11 @@ unsafe fn classify_meta_qual_node(
             // only matches `=`, and equality on segment_by is safe
             // because segmentation partitions rows along that value
             // (every row in a surviving segment satisfies the eq).
-            // It applies the filter only to a constant that converts
-            // exactly to the column's type (`const_datum_for_column`);
-            // accepting any other constant here would count every segment.
-            return opname == "="
-                && super::exec::const_datum_for_column(
-                    (*c).constvalue,
-                    (*c).consttype,
-                    (*var).vartype,
-                )
-                .is_some();
+            // It applies the filter exactly when `segment_eq_operands`
+            // accepts the qual; accepting anything else here would count
+            // every segment.
+            return super::exec::segment_eq_operands(node)
+                .is_some_and(|(v, _)| (*v).varattno == attno);
         }
 
         // Time column: accept range bounds.  Reject equality — a row
@@ -1151,6 +1146,55 @@ unsafe fn partitions_contain_time_range(
             }
         }
         true
+    }
+}
+
+/// Whether `node` (RelabelType already stripped) is a `Var` on a segment_by
+/// column of a text type. The segment_by list comes from the deltatable of
+/// the `Var`'s relation: the relation itself, or the parent of a partition
+/// queried directly. When it cannot be resolved, every text `Var` counts.
+unsafe fn is_segment_by_text_var(
+    root: *mut pg_sys::PlannerInfo,
+    node: *const pg_sys::Node,
+) -> bool {
+    unsafe {
+        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_Var {
+            return false;
+        }
+        let var = node as *const pg_sys::Var;
+        if !super::exec::is_text_type((*var).vartype) {
+            return false;
+        }
+        let varno = (*var).varno as usize;
+        if varno == 0 || varno >= (*root).simple_rel_array_size as usize {
+            return true;
+        }
+        let rte = *(*root).simple_rte_array.add(varno);
+        if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
+            return true;
+        }
+        let relid = (*rte).relid;
+        let meta = get_meta_cols(relid).or_else(|| {
+            if !pg_sys::get_rel_relispartition(relid) {
+                return None;
+            }
+            let parent = Spi::get_one_with_args::<pg_sys::Oid>(
+                "SELECT inhparent FROM pg_catalog.pg_inherits WHERE inhrelid = $1",
+                &[relid.into()],
+            )
+            .ok()
+            .flatten()?;
+            get_meta_cols(parent)
+        });
+        let Some((_, segment_by)) = meta else {
+            return true;
+        };
+        let name_ptr = pg_sys::get_attname(relid, (*var).varattno, true);
+        if name_ptr.is_null() {
+            return true;
+        }
+        let name = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy();
+        segment_by.iter().any(|s| *s == name)
     }
 }
 
@@ -2658,6 +2702,11 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         // extractable by extract_batch_quals at execution time, otherwise the
         // filter is silently dropped and AggScan produces wrong results.
         if has_where {
+            // A text qual on a segment_by column is pushed only as the
+            // equality that segment pruning applies (`segment_eq_operands`):
+            // nothing else evaluates it in the serial DeltaXAgg, so `<>`,
+            // LIKE, NOT LIKE and IN on such a column stay with PostgreSQL
+            // (`is_segment_by_text_var` below).
             // Get qual nodes from jointree->quals if available, otherwise from baserestrictinfo
             let qual_nodes: Vec<*const pg_sys::Node> = {
                 let jointree = (*parse).jointree;
@@ -2766,6 +2815,8 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         if (*const_node).constisnull {
                             return;
                         }
+                        let seg_text_var =
+                            is_segment_by_text_var(root, if var_on_left { a0 } else { a1 });
 
                         if is_like || is_not_like {
                             if !var_on_left {
@@ -2777,6 +2828,9 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             ) {
                                 return;
                             }
+                            if seg_text_var {
+                                return; // LIKE on a segment_by column: see above
+                            }
                         } else if matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID)
                             && matches!(opname, "=" | "<>" | "!=")
                         {
@@ -2785,6 +2839,11 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             }
                             if !super::exec::is_text_type((*const_node).consttype) {
                                 return; // e.g. `text = name`: not pushed
+                            }
+                            if seg_text_var
+                                && (opname != "=" || super::exec::segment_eq_operands(qn).is_none())
+                            {
+                                return; // only the pruned equality: see above
                             }
                         } else {
                             // Numeric/date/bool comparison — check type is supported
@@ -2867,6 +2926,9 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         else {
                             return;
                         };
+                        if is_segment_by_text_var(root, sa_a0) {
+                            return; // IN on a segment_by column: see above
+                        }
                         if super::exec::in_list_values(saop, sa_type_oid).is_none() {
                             return;
                         }
@@ -3755,7 +3817,20 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 if (*const_node).constisnull {
                     return;
                 }
-                let const_val = (*const_node).constvalue.value() as i64;
+                // DeltaXAgg reads the finalized aggregate as an i64 and
+                // compares it with this constant: exact only for an int4 or
+                // int8 aggregate against an integer constant. Anything else
+                // (avg and numeric sums, floats, timestamps, a numeric or
+                // float constant) is left to PostgreSQL.
+                if !matches!((*aggref_node).aggtype, pg_sys::INT4OID | pg_sys::INT8OID) {
+                    return;
+                }
+                let const_val: i64 = match (*const_node).consttype {
+                    pg_sys::INT2OID => (*const_node).constvalue.value() as i16 as i64,
+                    pg_sys::INT4OID => (*const_node).constvalue.value() as i32 as i64,
+                    pg_sys::INT8OID => (*const_node).constvalue.value() as i64,
+                    _ => return,
+                };
 
                 // Match the Aggref to a classified agg by position.
                 // Walk aggrefs in order and find which one matches this HAVING aggref.

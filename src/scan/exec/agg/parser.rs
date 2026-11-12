@@ -78,8 +78,12 @@ pub(super) unsafe fn build_agg_exec_context_from_plan(plan: ParsedAggPlan) -> Ag
             }
         }
 
-        let (batch_quals, _handled) =
-            extract_batch_quals(where_quals, &meta.col_names, &meta.col_types);
+        let (batch_quals, _handled) = extract_batch_quals(
+            where_quals,
+            &meta.col_names,
+            &meta.col_types,
+            &meta.segment_by,
+        );
         for bq in &batch_quals {
             if bq.col_idx < num_cols {
                 needed_cols[bq.col_idx] = true;
@@ -210,7 +214,7 @@ unsafe fn deserialize_case_when_value_inline(
 ///    num_aggs, (agg_type, col_idx, result_oid, col_type_oid, expr_kind [, extra])...,
 ///    num_groups, (col_idx, type_oid, expr_tag [, expr-specific fields])...,
 ///    num_output, (type, ref)...,
-///    num_having, (agg_idx, op, const_val)...,
+///    num_having, (agg_idx, op, const_hi, const_lo)...,
 ///    where_str_len, char0, char1, ...,
 ///    topn_limit [, sort_col, ascending]]
 ///
@@ -493,8 +497,10 @@ pub(super) unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> Par
             for _ in 0..num_having {
                 let agg_idx = pg_sys::list_nth_int(custom_private, idx) as usize;
                 let op_val = pg_sys::list_nth_int(custom_private, idx + 1);
-                let const_val = pg_sys::list_nth_int(custom_private, idx + 2) as i64;
-                idx += 3;
+                let const_hi = pg_sys::list_nth_int(custom_private, idx + 2) as i64;
+                let const_lo = pg_sys::list_nth_int(custom_private, idx + 3) as u32 as i64;
+                let const_val = (const_hi << 32) | const_lo;
+                idx += 4;
                 let op = match op_val {
                     0 => HavingOp::Gt,
                     1 => HavingOp::Lt,
@@ -953,18 +959,21 @@ mod tests {
                 0, // num_groups
                 1, // num_output
                 0, 0, // Agg(0)
-                2, // num_having = 2
-                0, 0, 10, // agg_idx=0, op=Gt(0), const=10
-                0, 4, 100, // agg_idx=0, op=Eq(4), const=100
+                3, // num_having = 3
+                0, 0, 0, 10, // agg_idx=0, op=Gt(0), const=10 (hi, lo)
+                0, 4, 0, 100, // agg_idx=0, op=Eq(4), const=100
+                0, 1, 1, 1, // agg_idx=0, op=Lt(1), const=4294967297 = 1 << 32 | 1
             ]);
 
             let plan = parse_agg_private(list);
-            assert_eq!(plan.having_filters.len(), 2);
+            assert_eq!(plan.having_filters.len(), 3);
             assert_eq!(plan.having_filters[0].agg_idx, 0);
             assert!(matches!(plan.having_filters[0].op, HavingOp::Gt));
             assert_eq!(plan.having_filters[0].const_val, 10);
             assert!(matches!(plan.having_filters[1].op, HavingOp::Eq));
             assert_eq!(plan.having_filters[1].const_val, 100);
+            assert!(matches!(plan.having_filters[2].op, HavingOp::Lt));
+            assert_eq!(plan.having_filters[2].const_val, 4_294_967_297);
         }
     }
 
@@ -1000,12 +1009,12 @@ mod tests {
                 0, // num_groups
                 1, 0, 0, // num_output=1, Agg(0)
                 6, // num_having = 6
-                0, 0, 1, // Gt
-                0, 1, 2, // Lt
-                0, 2, 3, // Ge
-                0, 3, 4, // Le
-                0, 4, 5, // Eq
-                0, 5, 6, // Ne
+                0, 0, 0, 1, // Gt
+                0, 1, 0, 2, // Lt
+                0, 2, 0, 3, // Ge
+                0, 3, 0, 4, // Le
+                0, 4, 0, 5, // Eq
+                0, 5, 0, 6, // Ne
             ]);
 
             let plan = parse_agg_private(list);

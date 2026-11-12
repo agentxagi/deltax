@@ -738,8 +738,12 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
 
         // Extract batch quals early — we need to know which extra columns to load
         let plan_qual = (*(*node).ss.ps.plan).qual;
-        let (batch_quals, handled_count) =
-            extract_batch_quals(plan_qual, &meta.col_names, &meta.col_types);
+        let (batch_quals, handled_count) = extract_batch_quals(
+            plan_qual,
+            &meta.col_names,
+            &meta.col_types,
+            &meta.segment_by,
+        );
         let nquals = if plan_qual.is_null() {
             0
         } else {
@@ -981,8 +985,14 @@ fn load_decompress_state(
     let metadata_us = t0.elapsed().as_micros() as u64;
 
     // Extract batch quals early — we need to know which extra columns to load
-    let (batch_quals, handled_count) =
-        unsafe { extract_batch_quals(plan_qual, &meta.col_names, &meta.col_types) };
+    let (batch_quals, handled_count) = unsafe {
+        extract_batch_quals(
+            plan_qual,
+            &meta.col_names,
+            &meta.col_types,
+            &meta.segment_by,
+        )
+    };
     let nquals = if plan_qual.is_null() {
         0
     } else {
@@ -4181,8 +4191,12 @@ pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
         // Now that col_names / col_types are live, rebuild qual-driven state
         // that the leader built in `begin_deltax_append`.
         let plan_qual = (*(*node).ss.ps.plan).qual;
-        let (batch_quals, handled_count) =
-            extract_batch_quals(plan_qual, &state.col_names, &state.col_types);
+        let (batch_quals, handled_count) = extract_batch_quals(
+            plan_qual,
+            &state.col_names,
+            &state.col_types,
+            &state.segment_by,
+        );
         let nquals = if plan_qual.is_null() {
             0
         } else {

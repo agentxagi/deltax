@@ -2427,12 +2427,14 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             }
         }
 
-        // HAVING filters: [num_having, agg_idx_0, op_0, const_val_0, ...]
+        // HAVING filters: [num_having, agg_idx_0, op_0, const_hi_0, const_lo_0, ...]
+        // (the int8 constant split in two 32-bit halves)
         let having_filters = take_agg_having_filters();
         private_list = pg_sys::lappend_int(private_list, having_filters.len() as i32);
         for hf in &having_filters {
             private_list = pg_sys::lappend_int(private_list, hf.agg_idx as i32);
             private_list = pg_sys::lappend_int(private_list, hf.op as i32);
+            private_list = pg_sys::lappend_int(private_list, (hf.const_val >> 32) as i32);
             private_list = pg_sys::lappend_int(private_list, hf.const_val as i32);
         }
 
