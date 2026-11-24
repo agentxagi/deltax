@@ -46,3 +46,37 @@ def test_extended_aggregate_matrix_matches_plain_postgres(
         plain_table=plain_table,
         deltax_table=deltax_table,
     )
+
+
+# ── FB-0298: DISTINCT em SUM/AVG ────────────────────────────────────────────
+#
+# O classificador só olhava `is_distinct` no braço de COUNT, então
+# `sum(DISTINCT x)` e `avg(DISTINCT x)` viravam Sum/Avg simples no caminho
+# DeltaX: a soma de segmento não sabe quais valores repetem e devolvia
+# `sum(x)`/`avg(x)` **em silêncio**. Reportado na produção (30/08–03/09:
+# 256133 no DeltaX contra 114794 no oráculo, sem precisar de HAVING).
+#
+# A correção faz o classificador desistir desses dois casos; o teste fixa o
+# contrato: o resultado tem de bater com o heap e o dataset tem de ter
+# repetição (senão DISTINCT não distingue nada e o teste passaria com o bug).
+
+
+@pytest.mark.parametrize("agg", ["sum", "avg"])
+def test_distinct_aggregate_matches_plain_postgres(aggregate_matrix, db, agg):
+    plain_table, deltax_table = aggregate_matrix
+
+    simple_sql = f"SELECT {agg}(device_id) FROM {{table}}"
+    distinct_sql = f"SELECT {agg}(DISTINCT device_id) FROM {{table}}"
+
+    plain_distinct = db.execute(distinct_sql.format(table=plain_table)).fetchall()
+    plain_simple = db.execute(simple_sql.format(table=plain_table)).fetchall()
+    assert plain_distinct != plain_simple, (
+        "dataset sem valor repetido em device_id: DISTINCT não distingue nada e o "
+        "teste não mediria o FB-0298"
+    )
+
+    delta_distinct = db.execute(distinct_sql.format(table=deltax_table)).fetchall()
+    assert delta_distinct == plain_distinct, (
+        f"{agg}(DISTINCT device_id) divergiu do Postgres puro: deltax={delta_distinct!r} "
+        f"plain={plain_distinct!r} (o caminho DeltaX tem de desistir e deixar o heap responder)"
+    )

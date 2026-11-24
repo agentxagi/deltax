@@ -2339,6 +2339,13 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
 
             match func_name {
                 "sum" => {
+                    // FB-0298: SUM(DISTINCT x) não é somável pelo caminho DeltaX — o
+                    // somatório de segmento não sabe quais valores repetem, e cair em
+                    // Sum simples devolve sum(x) em silêncio (produção 30/08–03/09:
+                    // 256133 em vez de 114794). Desiste e deixa o heap responder.
+                    if is_distinct {
+                        return;
+                    }
                     classified_aggs.push(path::AggSpec {
                         agg_type: AggType::Sum,
                         col_idx,
@@ -2355,6 +2362,11 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     }
                 }
                 "avg" => {
+                    // FB-0298: idem para AVG(DISTINCT x) — a média de segmento não tem
+                    // como excluir repetição; desistir é a resposta correta.
+                    if is_distinct {
+                        return;
+                    }
                     classified_aggs.push(path::AggSpec {
                         agg_type: AggType::Avg,
                         col_idx,
