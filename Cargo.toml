@@ -10,7 +10,12 @@ description = "PostgreSQL time-series extension with Gorilla compression"
 crate-type = ["cdylib", "lib"]
 
 [features]
-default = ["pg17"]
+# Sem `default`: um default de versão faz `cargo check --features pg18` morrer
+# com "Multiple pg$VERSION features found. Found: pg17, pg18" (o default soma
+# pg17 à lista). O Makefile e o CI já passam `--features pgXX` explicitamente;
+# sem default, o comando documentado (`cargo check --features pg18`) passa a
+# funcionar e esquecer a feature vira erro claro em vez de compilar em silêncio
+# contra a versão errada.
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18", "pg18_plus"]
 pg19 = ["pgrx/pg19", "pgrx-tests/pg19", "pg18_plus"]
