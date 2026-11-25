@@ -3766,46 +3766,24 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         break;
                     }
                 }
-                // If not found by pointer, match by aggfnoid + aggstar
+                // FB-0297: comparar o Aggref INTEIRO, não aggfnoid + aggstar + varattno.
+                // O matcher antigo aceitava `count(session_id)` da lista do SELECT como par de
+                // `count(DISTINCT session_id)` do HAVING — o grupo era filtrado pela contagem
+                // errada e o resultado saía em silêncio (produção 30/08 14:00→03/09 21:00:
+                // 18 grupos em vez do único `valorcode|1934`; só o valorcode passa de 20
+                // sessões distintas). `equal()` compara aggdistinct, aggfilter, args e
+                // aggorder de uma vez, que é o que o FB-0293 também pedia.
                 if agg_idx.is_none() {
                     for (i, &ar) in aggrefs.iter().enumerate() {
-                        if (*ar).aggfnoid == (*aggref_node).aggfnoid
-                            && (*ar).aggstar == (*aggref_node).aggstar
-                        {
-                            // For non-star, also match args
-                            if (*ar).aggstar {
-                                agg_idx = Some(i);
-                                break;
-                            }
-                            // Match by column: compare first arg's Var
-                            let ar_args = (*ar).args;
-                            let h_args = (*aggref_node).args;
-                            if !ar_args.is_null()
-                                && !h_args.is_null()
-                                && (*ar_args).length == 1
-                                && (*h_args).length == 1
-                            {
-                                let ar_te =
-                                    pg_sys::list_nth(ar_args, 0) as *const pg_sys::TargetEntry;
-                                let h_te =
-                                    pg_sys::list_nth(h_args, 0) as *const pg_sys::TargetEntry;
-                                let ar_expr = (*ar_te).expr as *const pg_sys::Node;
-                                let h_expr = (*h_te).expr as *const pg_sys::Node;
-                                if (*ar_expr).type_ == pg_sys::NodeTag::T_Var
-                                    && (*h_expr).type_ == pg_sys::NodeTag::T_Var
-                                {
-                                    let ar_var = ar_expr as *const pg_sys::Var;
-                                    let h_var = h_expr as *const pg_sys::Var;
-                                    if (*ar_var).varattno == (*h_var).varattno {
-                                        agg_idx = Some(i);
-                                        break;
-                                    }
-                                }
-                            }
+                        if pg_sys::equal(
+                            ar as *const _ as *const core::ffi::c_void,
+                            aggref_node as *const _ as *const core::ffi::c_void,
+                        ) {
+                            agg_idx = Some(i);
+                            break;
                         }
                     }
                 }
-
                 match agg_idx {
                     Some(idx) => {
                         having_filters.push(HavingFilter {
